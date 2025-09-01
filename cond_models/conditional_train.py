@@ -11,13 +11,17 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import argparse
 from datetime import datetime
 from torch.utils.data import DataLoader
+from torchvision.utils import save_image
+from PIL import Image
 
 # Import our conditional models
 from conditional_generator import ConditionalGenerator, SimpleConditionalGenerator
 from conditional_discriminator import ConditionalDiscriminator, SimpleConditionalDiscriminator
 from conditional_dataloader import ConditionalImageDataset, SingleDirectoryConditionalDataset
+from unpaired_conditional_dataloader import UnpairedConditionalImageDataset
 
 
 class ConditionalGANTrainer:
@@ -481,62 +485,273 @@ class ConditionalGANTrainer:
         plt.close()
 
 
+def get_device():
+    """Get the best available device for training."""
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    else:
+        return torch.device('cpu')
+
+
 def main():
-    """Main training function for conditional GAN"""
-    # Configuration
-    config = {
-        'fluorescent_dir': '../data/fluorescent',  # Directory with fluorescent images
-        'mask_dir': '../data/masks',               # Directory with binary masks
-        'latent_dim': 100,
-        'image_size': 256,
-        'lr': 0.0001,
-        'num_epochs': 100,
-        'batch_size': 4,
-        'save_interval': 5,
-        'quick_sample_freq': 5,
-        'use_simple_models': False  # Set to True for faster experimentation
-    }
+    """Main training function with argument parsing."""
+    import argparse
     
-    print("Conditional GAN Configuration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
+    parser = argparse.ArgumentParser(description='Train Conditional GAN')
+    parser.add_argument('--data_dir', type=str, default='/Users/edwheeler/cond_GAN/CellSimul/CellSimul/data',
+                       help='Base directory containing data')
+    parser.add_argument('--output_dir', type=str, default='/Users/edwheeler/cond_GAN/CellSimul/CellSimul/outputs',
+                       help='Directory to save outputs')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training')
+    parser.add_argument('--num_epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--device', type=str, default='auto', help='Device to use (cuda/mps/cpu/auto)')
+    parser.add_argument('--model_type', type=str, default='complex', choices=['simple', 'complex'],
+                       help='Type of model to use')
+    parser.add_argument('--save_frequency', type=int, default=5, help='Generate sample images every N epochs (models saved only at end)')
+    parser.add_argument('--paired', action='store_true', help='Use paired training data')
+    parser.add_argument('--fluorescence_dir', type=str, default='fluorescence_rescaled',
+                       help='Directory name for fluorescence images (for unpaired training)')
+    parser.add_argument('--distance_dir', type=str, default='distance_masks_rescaled', 
+                       help='Directory name for distance masks (for unpaired training)')
+    parser.add_argument('--max_images', type=int, default=None,
+                       help='Maximum number of images to use for training (useful for quick tests)')
     
-    # Check if data directories exist
-    if not os.path.exists(config['fluorescent_dir']):
-        print(f"\nError: Fluorescent directory '{config['fluorescent_dir']}' not found!")
-        print("Please create directories and place your files:")
-        print("  - fluorescent images in ../data/fluorescent/")
-        print("  - binary masks in ../data/masks/")
-        return
+    args = parser.parse_args()
     
-    try:
-        # Initialize and train conditional GAN
-        gan = ConditionalGANTrainer(
-            fluorescent_dir=config['fluorescent_dir'],
-            mask_dir=config['mask_dir'],
-            latent_dim=config['latent_dim'],
-            image_size=config['image_size'],
-            lr=config['lr'],
-            use_simple_models=config['use_simple_models']
+    # Setup device
+    if args.device == 'auto':
+        device = get_device()
+    else:
+        device = torch.device(args.device)
+    
+    print(f"Using device: {device}")
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Choose dataset based on training type
+    if args.paired:
+        print("Using paired training data...")
+        # For paired data, use the old-style trainer configuration
+        fluorescence_path = os.path.join(args.data_dir, args.fluorescence_dir)
+        distance_path = os.path.join(args.data_dir, args.distance_dir)
+        
+        print(f"Fluorescence images: {fluorescence_path}")
+        print(f"Distance masks: {distance_path}")
+        
+        # Initialize trainer with old approach
+        trainer = ConditionalGANTrainer(
+            fluorescent_dir=fluorescence_path,
+            mask_dir=distance_path,
+            latent_dim=100,
+            image_size=256,
+            lr=args.learning_rate,
+            use_simple_models=(args.model_type == 'simple')
         )
         
-        # Train the conditional GAN
-        gan.train(
-            num_epochs=config['num_epochs'],
-            batch_size=config['batch_size'],
-            save_interval=config['save_interval'],
-            quick_sample_freq=config['quick_sample_freq']
+        print(f"Starting paired training with {args.model_type} models...")
+        print(f"Batch size: {args.batch_size}, Epochs: {args.num_epochs}")
+        
+        # Train using old approach
+        trainer.train(
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            save_interval=args.save_frequency,
+            quick_sample_freq=5
         )
         
-        print("Conditional GAN training completed successfully!")
-        print("Check the 'cond_output/' directory for:")
-        print("  - Generated conditional samples")
-        print("  - Saved model checkpoints")
-        print("  - Training metrics and visualizations")
+    else:
+        print("Using unpaired training data...")
+        # Use unpaired dataset for real fluorescent + synthetic masks
+        fluorescence_path = os.path.join(args.data_dir, args.fluorescence_dir)
+        distance_path = os.path.join(args.data_dir, args.distance_dir)
         
-    except Exception as e:
-        print(f"Error during conditional GAN training: {e}")
-        print("Make sure you have paired fluorescent/mask TIF files and PyTorch installed.")
+        print(f"Fluorescence images: {fluorescence_path}")
+        print(f"Distance masks: {distance_path}")
+        
+        if not os.path.exists(fluorescence_path):
+            print(f"Error: Fluorescence directory '{fluorescence_path}' not found!")
+            return
+        if not os.path.exists(distance_path):
+            print(f"Error: Distance masks directory '{distance_path}' not found!")
+            return
+        
+        # Create unpaired dataset
+        try:
+            dataset = UnpairedConditionalImageDataset(
+                fluorescent_dir=fluorescence_path,
+                mask_dir=distance_path,
+                image_size=256,
+                max_images=args.max_images
+            )
+            print(f"Unpaired dataset size: {len(dataset)}")
+            
+            # Test the dataset
+            print("Testing dataset...")
+            sample_fluor, sample_mask = dataset[0]
+            print(f"Sample fluorescent shape: {sample_fluor.shape}, range: [{sample_fluor.min():.3f}, {sample_fluor.max():.3f}]")
+            print(f"Sample mask shape: {sample_mask.shape}, range: [{sample_mask.min():.3f}, {sample_mask.max():.3f}]")
+            
+            # Create data loader
+            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+            
+            # Initialize models based on type
+            if args.model_type == 'simple':
+                generator = SimpleConditionalGenerator().to(device)
+                discriminator = SimpleConditionalDiscriminator().to(device)
+            else:
+                generator = ConditionalGenerator().to(device)
+                discriminator = ConditionalDiscriminator().to(device)
+            
+            print(f"Initialized {args.model_type} models on {device}")
+            
+            # Initialize optimizers with different learning rates
+            g_optimizer = torch.optim.Adam(generator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))
+            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate*0.5, betas=(0.5, 0.999))  # Lower LR for discriminator
+            
+            # Loss functions
+            adversarial_criterion = nn.BCELoss()
+            identity_criterion = nn.L1Loss()
+            
+            print(f"Starting unpaired training...")
+            print(f"Batch size: {args.batch_size}, Epochs: {args.num_epochs}")
+            print(f"Learning rate: {args.learning_rate} (G), {args.learning_rate*0.5} (D)")
+            
+            # Simple training loop for unpaired data following CellSynthesis structure
+            for epoch in range(args.num_epochs):
+                epoch_d_loss = 0.0
+                epoch_g_loss = 0.0
+                epoch_adv_loss = 0.0
+                epoch_identity_loss = 0.0
+                num_batches = 0
+                
+                for batch_idx, (real_fluorescent, condition_masks) in enumerate(dataloader):
+                    real_fluorescent = real_fluorescent.to(device)
+                    condition_masks = condition_masks.to(device)
+                    batch_size = real_fluorescent.size(0)
+                    
+                    # ============================================
+                    # Train Generator (following CellSynthesis structure)
+                    # ============================================
+                    g_optimizer.zero_grad()
+                    
+                    # Generate fake fluorescent images
+                    z = torch.randn(batch_size, 100, device=device)
+                    generated_fluorescent = generator(z, condition_masks)
+                    
+                    # Identity loss (structure preservation) - this encourages consistency
+                    # We want the generator to be somewhat consistent with the input structures
+                    # Use same noise but with real fluorescent as additional "guidance"
+                    z_identity = torch.randn(batch_size, 100, device=device)
+                    # In CellSynthesis, identity loss compares output when using real images vs synthetic
+                    # Here we'll use a simpler approach: L1 loss between generated and real to preserve structures
+                    identity_loss = identity_criterion(generated_fluorescent, real_fluorescent) * 0.1  # Weight it lower
+                    
+                    # Adversarial loss - discriminator should think generated is real
+                    # Don't concatenate - our discriminator expects separate inputs
+                    d_output_fake = discriminator(generated_fluorescent, condition_masks)
+                    
+                    # Flatten discriminator output if needed
+                    if d_output_fake.dim() > 2:
+                        d_output_fake = d_output_fake.view(batch_size, -1).mean(dim=1)
+                    
+                    # Generator wants discriminator to output 1 (real)
+                    valid_labels = torch.ones(batch_size, device=device)
+                    adversarial_loss = adversarial_criterion(d_output_fake, valid_labels)
+                    
+                    # Combined generator loss (like CellSynthesis)
+                    g_loss = adversarial_loss + identity_loss
+                    g_loss.backward()
+                    g_optimizer.step()
+                    
+                    # ============================================
+                    # Train Discriminator (following CellSynthesis structure)
+                    # ============================================
+                    d_optimizer.zero_grad()
+                    
+                    # Real samples - don't concatenate, our discriminator takes separate inputs
+                    d_output_real = discriminator(real_fluorescent, condition_masks)
+                    
+                    # Flatten discriminator output if needed
+                    if d_output_real.dim() > 2:
+                        d_output_real = d_output_real.view(batch_size, -1).mean(dim=1)
+                    
+                    real_labels = torch.ones(batch_size, device=device)
+                    d_real_loss = adversarial_criterion(d_output_real, real_labels)
+                    
+                    # Fake samples - use detached generated images
+                    d_output_fake_for_d = discriminator(generated_fluorescent.detach(), condition_masks)
+                    
+                    # Flatten discriminator output if needed
+                    if d_output_fake_for_d.dim() > 2:
+                        d_output_fake_for_d = d_output_fake_for_d.view(batch_size, -1).mean(dim=1)
+                    
+                    fake_labels = torch.zeros(batch_size, device=device)
+                    d_fake_loss = adversarial_criterion(d_output_fake_for_d, fake_labels)
+                    
+                    # Combined discriminator loss
+                    d_loss = (d_real_loss + d_fake_loss) / 2
+                    d_loss.backward()
+                    d_optimizer.step()
+                    
+                    # Accumulate losses
+                    epoch_d_loss += d_loss.item()
+                    epoch_g_loss += g_loss.item()
+                    epoch_adv_loss += adversarial_loss.item()
+                    epoch_identity_loss += identity_loss.item()
+                    num_batches += 1
+                    
+                    if batch_idx % 10 == 0:
+                        print(f"  Epoch [{epoch+1}/{args.num_epochs}] Batch [{batch_idx}/{len(dataloader)}] "
+                              f"D_loss: {d_loss.item():.4f}, G_loss: {g_loss.item():.4f}, "
+                              f"Adv_loss: {adversarial_loss.item():.4f}, Identity_loss: {identity_loss.item():.4f}")
+                
+                # Epoch summary
+                avg_d_loss = epoch_d_loss / num_batches
+                avg_g_loss = epoch_g_loss / num_batches
+                avg_adv_loss = epoch_adv_loss / num_batches
+                avg_identity_loss = epoch_identity_loss / num_batches
+                print(f"Epoch [{epoch+1}/{args.num_epochs}] Average D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}")
+                print(f"  Adversarial_loss: {avg_adv_loss:.4f}, Identity_loss: {avg_identity_loss:.4f}")
+                
+                # Save models periodically (only at specified intervals, not every epoch)
+                if (epoch + 1) % args.save_frequency == 0:
+                    # Generate sample images for monitoring
+                    generator.eval()
+                    with torch.no_grad():
+                        # Use a fixed number of samples
+                        num_samples = min(4, batch_size)
+                        sample_z = torch.randn(num_samples, 100, device=device)
+                        sample_mask = condition_masks[:num_samples]  # Use first N masks from batch
+                        sample_generated = generator(sample_z, sample_mask)
+                        print(f"Generated sample shape: {sample_generated.shape}")
+                        
+                        # Save sample
+                        from torchvision.utils import save_image
+                        save_image(sample_generated, 
+                                  os.path.join(args.output_dir, f'unpaired_sample_epoch_{epoch+1}.png'),
+                                  normalize=True, nrow=2)
+                        print(f"Sample images saved at epoch {epoch+1}")
+                    generator.train()
+            
+            # Save final models only at the very end
+            print("Training completed! Saving final models...")
+            torch.save(generator.state_dict(), 
+                      os.path.join(args.output_dir, 'unpaired_generator_final.pth'))
+            torch.save(discriminator.state_dict(), 
+                      os.path.join(args.output_dir, 'unpaired_discriminator_final.pth'))
+            print("Final models saved!")
+            
+            print("Unpaired training completed!")
+            
+        except Exception as e:
+            print(f"Error during unpaired training: {e}")
+            import traceback
+            traceback.print_exc()
+            return
 
 
 if __name__ == "__main__":

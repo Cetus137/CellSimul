@@ -1,7 +1,7 @@
 import os
 import glob
 from skimage import io
-from .rescale_save import save_and_rescale_mask  # Use the actual function name
+from rescale_save import save_and_rescale_mask  # Use the actual function name
 
 def load_and_rescale_tif_files(input_dir, output_dir):
     """
@@ -33,3 +33,8 @@ def load_and_rescale_tif_files(input_dir, output_dir):
         print(f"Processed: {filename}")
     
     print(f"Finished processing {len(tif_files)} files")
+
+if __name__ == "__main__":
+    input_directory = "/Users/edwheeler/cond_GAN/CellSimul/CellSimul/data/fluorescence"  # Change to your input directory
+    output_directory = "/Users/edwheeler/cond_GAN/CellSimul/CellSimul/data/fluorescence_rescaled"  # Change to your desired output directory
+    load_and_rescale_tif_files(input_directory, output_directory)

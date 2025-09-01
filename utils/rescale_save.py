@@ -32,7 +32,7 @@ def save_and_rescale_mask(mask, filename, output_dir="./output"):
     
     # Save as TIF
     filepath = os.path.join(output_dir, filename)
-    if not filepath.lower().endswith(('.tif', '.tiff')):
+    if not filepath.endswith('.tif'):
         filepath += '.tif'
     img_resized.save(filepath)
     
