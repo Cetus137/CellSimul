@@ -177,6 +177,9 @@ class ConditionalGANTrainer:
             real_labels = torch.full((batch_size,), real_label, dtype=torch.float, device=self.device)
             real_output = self.discriminator(real_fluorescent, real_masks)
             
+            # Clamp discriminator output to prevent rounding errors
+            real_output = torch.clamp(real_output, 1e-7, 1-1e-7)
+            
             # Handle patch-based or simple discriminator output
             if len(real_output.shape) > 2:  # Patch-based
                 real_output = real_output.mean(dim=[2, 3]).view(-1)
@@ -192,6 +195,9 @@ class ConditionalGANTrainer:
             # Fake data (generated fluorescent + real mask)
             fake_labels = torch.full((batch_size,), fake_label, dtype=torch.float, device=self.device)
             fake_output = self.discriminator(fake_fluorescent.detach(), real_masks)
+            
+            # Clamp discriminator output to prevent rounding errors
+            fake_output = torch.clamp(fake_output, 1e-7, 1-1e-7)
             
             # Handle patch-based or simple discriminator output
             if len(fake_output.shape) > 2:  # Patch-based
@@ -221,6 +227,9 @@ class ConditionalGANTrainer:
             
             # Try to fool discriminator
             fake_output_for_g = self.discriminator(fake_fluorescent_for_g, real_masks)
+            
+            # Clamp discriminator output to prevent rounding errors
+            fake_output_for_g = torch.clamp(fake_output_for_g, 1e-7, 1-1e-7)
             
             # Handle patch-based or simple discriminator output
             if len(fake_output_for_g.shape) > 2:  # Patch-based
@@ -359,7 +368,7 @@ class ConditionalGANTrainer:
             # Generated fluorescent
             fake_img = fake_sample[0].cpu().squeeze().numpy()
             fake_img = (fake_img + 1) / 2  # Denormalize
-            axes[1].imshow(fake_img, cmap='green')
+            axes[1].imshow(fake_img)
             axes[1].set_title('Generated Fluorescent')
             axes[1].axis('off')
             
@@ -652,7 +661,28 @@ def main():
                         real_features = real_features.view(batch_size, -1)
                         fake_features = fake_features.view(batch_size, -1)
                     
+                    # Standard feature matching
                     feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 10.0
+                    
+                    # Mask-weighted feature matching - give more importance to regions with high distance values
+                    mask_norm_for_features = (condition_masks - condition_masks.min()) / (condition_masks.max() - condition_masks.min() + 1e-8)
+                    
+                    # Apply mask weighting to the generated and real images before feature extraction
+                    mask_weighted_real = real_fluorescent * (mask_norm_for_features * 2.0 + 0.5)  # Boost mask regions
+                    mask_weighted_fake = generated_fluorescent * (mask_norm_for_features * 2.0 + 0.5)
+                    
+                    with torch.no_grad():
+                        real_features_weighted = discriminator(mask_weighted_real, condition_masks)
+                    fake_features_weighted = discriminator(mask_weighted_fake, condition_masks)
+                    
+                    if real_features_weighted.dim() > 2:
+                        real_features_weighted = real_features_weighted.view(batch_size, -1)
+                        fake_features_weighted = fake_features_weighted.view(batch_size, -1)
+                    
+                    mask_weighted_feature_loss = nn.L1Loss()(fake_features_weighted, real_features_weighted) * 8.0
+                    
+                    # Combine feature losses
+                    total_feature_loss = feature_matching_loss + mask_weighted_feature_loss
                     
                     # Mask consistency loss - ensure generated content respects mask structure
                     # Areas with high mask values should have higher fluorescent intensity
@@ -660,13 +690,63 @@ def main():
                     if condition_masks.max() > condition_masks.min():  # Only if mask has variation
                         # Normalize mask to [0,1] and generated to [0,1]
                         mask_norm = (condition_masks - condition_masks.min()) / (condition_masks.max() - condition_masks.min() + 1e-8)
-                        gen_norm = (generated_fluorescent - generated_fluorescent.min()) / (generated_fluorescent.max() - generated_fluorescent.min() + 1e-8)
+                        gen_norm = (generated_fluorescent + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
                         
-                        # Correlation loss - high mask areas should correlate with high fluorescence
-                        mask_consistency_loss = -torch.mean(mask_norm * gen_norm) * 5.0
+                        # 1. Strong spatial correlation loss - high mask areas should have high fluorescence
+                        spatial_correlation = torch.mean(mask_norm * gen_norm) 
+                        mask_consistency_loss = -spatial_correlation * 15.0  # Increased weight
+                        
+                        # 2. Distance-weighted intensity loss - stronger fluorescence at mask centers
+                        # Use mask as distance transform - higher values = closer to membrane center
+                        distance_weights = mask_norm  # Distance transform values as weights
+                        weighted_fluorescence = gen_norm * distance_weights
+                        distance_consistency_loss = -torch.mean(weighted_fluorescence) * 10.0
+                        
+                        # 3. Gradient consistency - generated gradients should align with mask gradients
+                        # Compute gradients using Sobel-like operators
+                        def compute_gradients(tensor):
+                            # Simple gradient computation
+                            grad_x = tensor[:, :, :, 1:] - tensor[:, :, :, :-1]  # Horizontal gradient
+                            grad_y = tensor[:, :, 1:, :] - tensor[:, :, :-1, :]  # Vertical gradient
+                            return grad_x, grad_y
+                        
+                        mask_grad_x, mask_grad_y = compute_gradients(mask_norm)
+                        gen_grad_x, gen_grad_y = compute_gradients(gen_norm)
+                        
+                        # Pad to match dimensions
+                        min_h = min(mask_grad_x.shape[2], gen_grad_x.shape[2])
+                        min_w = min(mask_grad_x.shape[3], gen_grad_x.shape[3])
+                        
+                        mask_grad_x = mask_grad_x[:, :, :min_h, :min_w]
+                        mask_grad_y = mask_grad_y[:, :, :min_h, :min_w]
+                        gen_grad_x = gen_grad_x[:, :, :min_h, :min_w]
+                        gen_grad_y = gen_grad_y[:, :, :min_h, :min_w]
+                        
+                        gradient_consistency_loss = (
+                            torch.mean((mask_grad_x - gen_grad_x) ** 2) + 
+                            torch.mean((mask_grad_y - gen_grad_y) ** 2)
+                        ) * 5.0
+                        
+                        # 4. Binary mask guidance - ensure fluorescence is concentrated in high-distance areas
+                        # Create binary mask from distance transform (threshold at 75th percentile)
+                        mask_flat = mask_norm.view(batch_size, -1)
+                        threshold = torch.quantile(mask_flat, 0.75, dim=1, keepdim=True).unsqueeze(-1).unsqueeze(-1)
+                        binary_mask = (mask_norm > threshold).float()
+                        
+                        # Fluorescence should be higher in binary mask areas
+                        inside_fluorescence = torch.mean(gen_norm * binary_mask)
+                        outside_fluorescence = torch.mean(gen_norm * (1 - binary_mask))
+                        binary_guidance_loss = -(inside_fluorescence - outside_fluorescence) * 8.0
+                        
+                        # Combine all mask consistency losses
+                        mask_consistency_loss = (mask_consistency_loss + distance_consistency_loss + 
+                                               gradient_consistency_loss + binary_guidance_loss)
                     
                     # Adversarial loss - discriminator should think generated is real
                     d_output_fake = discriminator(generated_fluorescent, condition_masks)
+                    
+                    # Clamp discriminator output to prevent rounding errors
+                    d_output_fake = torch.clamp(d_output_fake, 1e-7, 1-1e-7)
                     
                     # Flatten discriminator output if needed
                     if d_output_fake.dim() > 2:
@@ -677,7 +757,7 @@ def main():
                     adversarial_loss = adversarial_criterion(d_output_fake, valid_labels)
                     
                     # Combined generator loss with better feature learning
-                    g_loss = adversarial_loss + feature_matching_loss + mask_consistency_loss
+                    g_loss = adversarial_loss + total_feature_loss + mask_consistency_loss
                     g_loss.backward()
                     g_optimizer.step()
                     
@@ -689,6 +769,9 @@ def main():
                     # Real samples - discriminator should output high values
                     d_output_real = discriminator(real_fluorescent, condition_masks)
                     
+                    # Clamp discriminator output to prevent rounding errors
+                    d_output_real = torch.clamp(d_output_real, 1e-7, 1-1e-7)
+                    
                     # Flatten discriminator output if needed
                     if d_output_real.dim() > 2:
                         d_output_real = d_output_real.view(batch_size, -1).mean(dim=1)
@@ -699,6 +782,9 @@ def main():
                     
                     # Fake samples - discriminator should output low values
                     d_output_fake_for_d = discriminator(generated_fluorescent.detach(), condition_masks)
+                    
+                    # Clamp discriminator output to prevent rounding errors
+                    d_output_fake_for_d = torch.clamp(d_output_fake_for_d, 1e-7, 1-1e-7)
                     
                     # Flatten discriminator output if needed
                     if d_output_fake_for_d.dim() > 2:
@@ -721,13 +807,14 @@ def main():
                     epoch_d_loss += d_loss.item()
                     epoch_g_loss += g_loss.item()
                     epoch_adv_loss += adversarial_loss.item()
-                    epoch_identity_loss += feature_matching_loss.item()  # Track feature matching instead
+                    epoch_identity_loss += total_feature_loss.item()  # Track total feature matching
                     num_batches += 1
                     
                     if batch_idx % 10 == 0:
                         print(f"  Epoch [{epoch+1}/{args.num_epochs}] Batch [{batch_idx}/{len(dataloader)}] "
                               f"D_loss: {d_loss.item():.4f}, G_loss: {g_loss.item():.4f}, "
-                              f"Adv_loss: {adversarial_loss.item():.4f}, Feature_loss: {feature_matching_loss.item():.4f}")
+                              f"Adv_loss: {adversarial_loss.item():.4f}, Feature_loss: {total_feature_loss.item():.4f}, "
+                              f"Mask_consistency: {mask_consistency_loss.item():.4f}")
                 
                 # Epoch summary
                 avg_d_loss = epoch_d_loss / num_batches
@@ -763,8 +850,48 @@ def main():
                         # Check if there's correlation between mask and generated content
                         mask_flat = sample_mask.view(num_samples, -1)
                         gen_flat = sample_generated.view(num_samples, -1)
-                        correlation = torch.corrcoef(torch.cat([mask_flat.mean(0, keepdim=True), gen_flat.mean(0, keepdim=True)]))[0,1]
-                        print(f"Mask-Generation correlation: {correlation:.3f}")
+                        
+                        # Compute correlation for each sample and take mean
+                        correlations = []
+                        for i in range(num_samples):
+                            mask_sample = mask_flat[i]
+                            gen_sample = gen_flat[i]
+                            
+                            # Normalize to [0,1] for correlation calculation
+                            mask_norm = (mask_sample - mask_sample.min()) / (mask_sample.max() - mask_sample.min() + 1e-8)
+                            gen_norm = (gen_sample + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+                            
+                            # Calculate Pearson correlation
+                            mask_centered = mask_norm - mask_norm.mean()
+                            gen_centered = gen_norm - gen_norm.mean()
+                            correlation = torch.sum(mask_centered * gen_centered) / (
+                                torch.sqrt(torch.sum(mask_centered**2)) * torch.sqrt(torch.sum(gen_centered**2)) + 1e-8
+                            )
+                            correlations.append(correlation.item())
+                        
+                        avg_correlation = np.mean(correlations)
+                        print(f"Mask-Generation correlation: {avg_correlation:.3f}")
+                        
+                        # Additional metric: intensity in high-distance areas vs low-distance areas
+                        for i in range(min(2, num_samples)):  # Check first 2 samples
+                            mask_sample = sample_mask[i].squeeze()
+                            gen_sample = sample_generated[i].squeeze()
+                            
+                            # Normalize mask
+                            mask_norm = (mask_sample - mask_sample.min()) / (mask_sample.max() - mask_sample.min() + 1e-8)
+                            gen_norm = (gen_sample + 1.0) / 2.0
+                            
+                            # Create binary mask at 75th percentile
+                            threshold = torch.quantile(mask_norm.flatten(), 0.75)
+                            high_distance_mask = mask_norm > threshold
+                            low_distance_mask = mask_norm <= threshold
+                            
+                            high_area_intensity = gen_norm[high_distance_mask].mean().item()
+                            low_area_intensity = gen_norm[low_distance_mask].mean().item()
+                            intensity_ratio = high_area_intensity / (low_area_intensity + 1e-8)
+                            
+                            print(f"Sample {i+1} - High/Low intensity ratio: {intensity_ratio:.3f} "
+                                  f"(should be > 1.0 for good conditioning)")
                         
                         # Save sample
                         from torchvision.utils import save_image

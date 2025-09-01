@@ -1,0 +1,15 @@
+Multiple Mask Generation Summary
+===================================
+
+Generator model: /Users/edwheeler/cond_GAN/CellSimul/CellSimul/outputs/models/unpaired_generator_final.pth
+Model type: complex
+Number of masks used: 4
+Mask folder: /Users/edwheeler/cond_GAN/CellSimul/CellSimul/data/distance_masks_rescaled
+
+Selected masks:
+  1. Index 000: fluorescent_mask_001.tif
+  2. Index 010: fluorescent_mask_011.tif
+  3. Index 020: fluorescent_mask_021.tif
+  4. Index 030: fluorescent_mask_031.tif
+
+Results saved to: /Users/edwheeler/cond_GAN/CellSimul/CellSimul/outputs/predictions
