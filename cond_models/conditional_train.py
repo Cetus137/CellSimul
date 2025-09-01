@@ -824,7 +824,16 @@ def main():
                 print(f"Epoch [{epoch+1}/{args.num_epochs}] Average D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}")
                 print(f"  Adversarial_loss: {avg_adv_loss:.4f}, Feature_matching_loss: {avg_identity_loss:.4f}")
                 
-                # Save models periodically (only at specified intervals, not every epoch)
+                # Save models periodically every 100 epochs (overwrite)
+                if (epoch + 1) % 100 == 0:
+                    print(f"Saving models at epoch {epoch+1}...")
+                    torch.save(generator.state_dict(), 
+                              os.path.join(args.output_dir, 'unpaired_generator_checkpoint.pth'))
+                    torch.save(discriminator.state_dict(), 
+                              os.path.join(args.output_dir, 'unpaired_discriminator_checkpoint.pth'))
+                    print(f"Checkpoint models saved at epoch {epoch+1}!")
+                
+                # Generate sample images for monitoring
                 if (epoch + 1) % args.save_frequency == 0:
                     # Generate sample images for monitoring
                     generator.eval()
@@ -893,12 +902,18 @@ def main():
                             print(f"Sample {i+1} - High/Low intensity ratio: {intensity_ratio:.3f} "
                                   f"(should be > 1.0 for good conditioning)")
                         
-                        # Save sample
+                        # Save sample generated images
                         from torchvision.utils import save_image
                         save_image(sample_generated, 
                                   os.path.join(args.output_dir, f'unpaired_sample_epoch_{epoch+1}.png'),
                                   normalize=True, nrow=2)
-                        print(f"Sample images saved at epoch {epoch+1}")
+                        
+                        # Save input masks that were used to create the samples
+                        save_image(sample_mask, 
+                                  os.path.join(args.output_dir, f'unpaired_masks_epoch_{epoch+1}.png'),
+                                  normalize=True, nrow=2)
+                        
+                        print(f"Sample images and input masks saved at epoch {epoch+1}")
                     generator.train()
             
             # Save final models only at the very end
