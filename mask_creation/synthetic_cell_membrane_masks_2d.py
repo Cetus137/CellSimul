@@ -143,9 +143,6 @@ class SyntheticCellMembranes2D:
         
         # Use density as a direct multiplier for number of cells
         target_cells = int(self.cell_density * total_area / avg_cell_area)
-        # For very high density, add extra cells to compensate for placement failures
-        if self.cell_density > 0.8:
-            target_cells = int(target_cells * 1.3)
         
         # For high density, use smaller minimum distance
         min_distance = avg_cell_radius * 0.5  # Increased spacing to prevent merging

@@ -3,6 +3,11 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+
+*.tif
+*.tiff
+.DS_store
+
 # C extensions
 *.so
 
