@@ -651,38 +651,55 @@ def main():
                     z = torch.randn(batch_size, 100, device=device)
                     generated_fluorescent = generator(z, condition_masks)
                     
-                    # CELLSYNTHESIS APPROACH: Identity Loss for Structure Preservation
-                    # Force generator to preserve structures when given real fluorescent as input
-                    # This is CRITICAL for ensuring the generator respects mask structure
-                    real_fluorescent_as_condition = real_fluorescent  # Use real fluorescent as "mask" input
+                    # ENHANCED CONDITIONING APPROACH v2.0
+                    # Key insight: The current approach has negative correlation - we need to fix this
+                    
+                    # 1. STRONGER Identity Loss for Structure Preservation (increased weight)
+                    real_fluorescent_as_condition = real_fluorescent
                     identity_fluorescent = generator(z, real_fluorescent_as_condition)
-                    identity_loss = nn.L1Loss()(identity_fluorescent, real_fluorescent) * 50.0  # High weight!
+                    identity_loss = nn.L1Loss()(identity_fluorescent, real_fluorescent) * 100.0  # Doubled weight
                     
-                    # STRONGER Distance Transform Conditioning
-                    # The key insight: generated intensity should be PROPORTIONAL to distance values
-                    mask_norm = (condition_masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
-                    gen_norm = (generated_fluorescent + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+                    # 2. DIRECT CORRELATION ENFORCEMENT
+                    # The problem: we're getting negative correlation, so let's directly enforce positive correlation
+                    mask_flat = condition_masks.view(batch_size, -1)
+                    gen_flat = generated_fluorescent.view(batch_size, -1)
                     
-                    # 1. DIRECT PROPORTIONALITY: Generated intensity = Distance * scaling_factor
-                    distance_proportional_loss = nn.MSELoss()(gen_norm, mask_norm * 0.8) * 25.0  # Force proportionality
+                    # Normalize to zero mean for correlation calculation
+                    mask_centered = mask_flat - mask_flat.mean(dim=1, keepdim=True)
+                    gen_centered = gen_flat - gen_flat.mean(dim=1, keepdim=True)
                     
-                    # 2. MEMBRANE-SPECIFIC CONDITIONING: High distance = High fluorescence
-                    # Create membrane regions (high distance areas)
-                    membrane_threshold = torch.quantile(mask_norm.view(batch_size, -1), 0.6, dim=1).view(batch_size, 1, 1, 1)
-                    membrane_mask = (mask_norm > membrane_threshold).float()
+                    # Pearson correlation coefficient
+                    mask_std = torch.sqrt(torch.sum(mask_centered ** 2, dim=1) + 1e-8)
+                    gen_std = torch.sqrt(torch.sum(gen_centered ** 2, dim=1) + 1e-8)
+                    correlation = torch.sum(mask_centered * gen_centered, dim=1) / (mask_std * gen_std + 1e-8)
                     
-                    # Fluorescence should be HIGH in membrane regions
-                    membrane_intensity_loss = -torch.mean(gen_norm * membrane_mask) * 20.0
+                    # Maximize positive correlation (penalize negative correlation heavily)
+                    correlation_loss = torch.mean(torch.clamp(1.0 - correlation, min=0.0)) * 75.0
                     
-                    # 3. BACKGROUND SUPPRESSION: Low distance = Low fluorescence  
-                    background_mask = (mask_norm < 0.3).float()
-                    background_suppression_loss = torch.mean(gen_norm * background_mask) * 15.0
+                    # 3. INTENSITY RATIO ENFORCEMENT
+                    # High mask regions should have significantly higher intensity than low mask regions
+                    mask_norm = (condition_masks + 1.0) / 2.0  # [0,1] range
+                    gen_norm = (generated_fluorescent + 1.0) / 2.0  # [0,1] range
                     
-                    # 4. CELLSYNTHESIS-STYLE: Use discriminator with separate image and mask inputs
-                    # But apply stronger conditioning in the loss functions
+                    # Define high/low regions based on mask quantiles
+                    mask_high_threshold = torch.quantile(mask_norm.view(batch_size, -1), 0.75, dim=1).view(batch_size, 1, 1, 1)
+                    mask_low_threshold = torch.quantile(mask_norm.view(batch_size, -1), 0.25, dim=1).view(batch_size, 1, 1, 1)
                     
-                    # Feature matching loss - encourage generated images to have realistic features
-                    # Extract features from real and generated images using discriminator
+                    high_mask_regions = (mask_norm >= mask_high_threshold).float()
+                    low_mask_regions = (mask_norm <= mask_low_threshold).float()
+                    
+                    # Calculate mean intensities
+                    high_intensity = torch.sum(gen_norm * high_mask_regions, dim=[1,2,3]) / (torch.sum(high_mask_regions, dim=[1,2,3]) + 1e-8)
+                    low_intensity = torch.sum(gen_norm * low_mask_regions, dim=[1,2,3]) / (torch.sum(low_mask_regions, dim=[1,2,3]) + 1e-8)
+                    
+                    # Enforce high_intensity > low_intensity with margin
+                    intensity_ratio_loss = torch.mean(F.relu(low_intensity - high_intensity + 0.2)) * 50.0
+                    
+                    # 4. DIRECT INTENSITY MAPPING
+                    # Force generated intensities to follow mask values more directly
+                    direct_mapping_loss = nn.MSELoss()(gen_norm, mask_norm) * 30.0
+                    
+                    # 5. Feature matching loss (reduced weight to focus on conditioning)
                     with torch.no_grad():
                         real_features = discriminator(real_fluorescent, condition_masks)
                     fake_features = discriminator(generated_fluorescent, condition_masks)
@@ -691,11 +708,10 @@ def main():
                         real_features = real_features.view(batch_size, -1)
                         fake_features = fake_features.view(batch_size, -1)
                     
-                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 15.0
+                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 10.0  # Reduced weight
                     
-                    # Combine all mask consistency losses
-                    mask_consistency_loss = (distance_proportional_loss + membrane_intensity_loss + 
-                                           background_suppression_loss)
+                    # Combine conditioning losses
+                    mask_consistency_loss = (correlation_loss + intensity_ratio_loss + direct_mapping_loss)
                     
                     # Adversarial loss - discriminator should think generated is real
                     d_output_fake = discriminator(generated_fluorescent, condition_masks)
@@ -762,14 +778,15 @@ def main():
                     epoch_d_loss += d_loss.item()
                     epoch_g_loss += g_loss.item()
                     epoch_adv_loss += adversarial_loss.item()
-                    epoch_identity_loss += feature_matching_loss.item()  # Track feature matching
+                    epoch_identity_loss += identity_loss.item()  # Track identity loss
                     num_batches += 1
                     
                     if batch_idx % 10 == 0:
                         print(f"  Epoch [{epoch+1}/{args.num_epochs}] Batch [{batch_idx}/{len(dataloader)}] "
                               f"D_loss: {d_loss.item():.4f}, G_loss: {g_loss.item():.4f}, "
                               f"Adv_loss: {adversarial_loss.item():.4f}, Feature_loss: {feature_matching_loss.item():.4f}, "
-                              f"Identity_loss: {identity_loss.item():.4f}, Mask_consistency: {mask_consistency_loss.item():.4f}")
+                              f"Identity_loss: {identity_loss.item():.4f}, Correlation_loss: {correlation_loss.item():.4f}, "
+                              f"Intensity_ratio: {intensity_ratio_loss.item():.4f}, Direct_mapping: {direct_mapping_loss.item():.4f}")
                 
                 # Epoch summary
                 avg_d_loss = epoch_d_loss / num_batches
@@ -777,7 +794,7 @@ def main():
                 avg_adv_loss = epoch_adv_loss / num_batches
                 avg_identity_loss = epoch_identity_loss / num_batches
                 print(f"Epoch [{epoch+1}/{args.num_epochs}] Average D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}")
-                print(f"  Adversarial_loss: {avg_adv_loss:.4f}, Feature_matching_loss: {avg_identity_loss:.4f}")
+                print(f"  Identity_loss: {avg_identity_loss:.4f}, Adversarial_loss: {avg_adv_loss:.4f}")
                 
                 # Save models periodically every 100 epochs (overwrite)
                 if (epoch + 1) % 100 == 0:
