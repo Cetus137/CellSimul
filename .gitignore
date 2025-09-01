@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 *.png
+*.png
 *.pth
 *.tif
 *.tiff
