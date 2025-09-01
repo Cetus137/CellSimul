@@ -651,6 +651,36 @@ def main():
                     z = torch.randn(batch_size, 100, device=device)
                     generated_fluorescent = generator(z, condition_masks)
                     
+                    # CELLSYNTHESIS APPROACH: Identity Loss for Structure Preservation
+                    # Force generator to preserve structures when given real fluorescent as input
+                    # This is CRITICAL for ensuring the generator respects mask structure
+                    real_fluorescent_as_condition = real_fluorescent  # Use real fluorescent as "mask" input
+                    identity_fluorescent = generator(z, real_fluorescent_as_condition)
+                    identity_loss = nn.L1Loss()(identity_fluorescent, real_fluorescent) * 50.0  # High weight!
+                    
+                    # STRONGER Distance Transform Conditioning
+                    # The key insight: generated intensity should be PROPORTIONAL to distance values
+                    mask_norm = (condition_masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+                    gen_norm = (generated_fluorescent + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+                    
+                    # 1. DIRECT PROPORTIONALITY: Generated intensity = Distance * scaling_factor
+                    distance_proportional_loss = nn.MSELoss()(gen_norm, mask_norm * 0.8) * 25.0  # Force proportionality
+                    
+                    # 2. MEMBRANE-SPECIFIC CONDITIONING: High distance = High fluorescence
+                    # Create membrane regions (high distance areas)
+                    membrane_threshold = torch.quantile(mask_norm.view(batch_size, -1), 0.6, dim=1).view(batch_size, 1, 1, 1)
+                    membrane_mask = (mask_norm > membrane_threshold).float()
+                    
+                    # Fluorescence should be HIGH in membrane regions
+                    membrane_intensity_loss = -torch.mean(gen_norm * membrane_mask) * 20.0
+                    
+                    # 3. BACKGROUND SUPPRESSION: Low distance = Low fluorescence  
+                    background_mask = (mask_norm < 0.3).float()
+                    background_suppression_loss = torch.mean(gen_norm * background_mask) * 15.0
+                    
+                    # 4. CELLSYNTHESIS-STYLE: Use discriminator with separate image and mask inputs
+                    # But apply stronger conditioning in the loss functions
+                    
                     # Feature matching loss - encourage generated images to have realistic features
                     # Extract features from real and generated images using discriminator
                     with torch.no_grad():
@@ -661,86 +691,11 @@ def main():
                         real_features = real_features.view(batch_size, -1)
                         fake_features = fake_features.view(batch_size, -1)
                     
-                    # Standard feature matching
-                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 10.0
+                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 15.0
                     
-                    # Mask-weighted feature matching - give more importance to regions with high distance values
-                    mask_norm_for_features = (condition_masks - condition_masks.min()) / (condition_masks.max() - condition_masks.min() + 1e-8)
-                    
-                    # Apply mask weighting to the generated and real images before feature extraction
-                    mask_weighted_real = real_fluorescent * (mask_norm_for_features * 2.0 + 0.5)  # Boost mask regions
-                    mask_weighted_fake = generated_fluorescent * (mask_norm_for_features * 2.0 + 0.5)
-                    
-                    with torch.no_grad():
-                        real_features_weighted = discriminator(mask_weighted_real, condition_masks)
-                    fake_features_weighted = discriminator(mask_weighted_fake, condition_masks)
-                    
-                    if real_features_weighted.dim() > 2:
-                        real_features_weighted = real_features_weighted.view(batch_size, -1)
-                        fake_features_weighted = fake_features_weighted.view(batch_size, -1)
-                    
-                    mask_weighted_feature_loss = nn.L1Loss()(fake_features_weighted, real_features_weighted) * 8.0
-                    
-                    # Combine feature losses
-                    total_feature_loss = feature_matching_loss + mask_weighted_feature_loss
-                    
-                    # Mask consistency loss - ensure generated content respects mask structure
-                    # Areas with high mask values should have higher fluorescent intensity
-                    mask_consistency_loss = 0.0
-                    if condition_masks.max() > condition_masks.min():  # Only if mask has variation
-                        # Normalize mask to [0,1] and generated to [0,1]
-                        mask_norm = (condition_masks - condition_masks.min()) / (condition_masks.max() - condition_masks.min() + 1e-8)
-                        gen_norm = (generated_fluorescent + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
-                        
-                        # 1. Strong spatial correlation loss - high mask areas should have high fluorescence
-                        spatial_correlation = torch.mean(mask_norm * gen_norm) 
-                        mask_consistency_loss = -spatial_correlation * 15.0  # Increased weight
-                        
-                        # 2. Distance-weighted intensity loss - stronger fluorescence at mask centers
-                        # Use mask as distance transform - higher values = closer to membrane center
-                        distance_weights = mask_norm  # Distance transform values as weights
-                        weighted_fluorescence = gen_norm * distance_weights
-                        distance_consistency_loss = -torch.mean(weighted_fluorescence) * 10.0
-                        
-                        # 3. Gradient consistency - generated gradients should align with mask gradients
-                        # Compute gradients using Sobel-like operators
-                        def compute_gradients(tensor):
-                            # Simple gradient computation
-                            grad_x = tensor[:, :, :, 1:] - tensor[:, :, :, :-1]  # Horizontal gradient
-                            grad_y = tensor[:, :, 1:, :] - tensor[:, :, :-1, :]  # Vertical gradient
-                            return grad_x, grad_y
-                        
-                        mask_grad_x, mask_grad_y = compute_gradients(mask_norm)
-                        gen_grad_x, gen_grad_y = compute_gradients(gen_norm)
-                        
-                        # Pad to match dimensions
-                        min_h = min(mask_grad_x.shape[2], gen_grad_x.shape[2])
-                        min_w = min(mask_grad_x.shape[3], gen_grad_x.shape[3])
-                        
-                        mask_grad_x = mask_grad_x[:, :, :min_h, :min_w]
-                        mask_grad_y = mask_grad_y[:, :, :min_h, :min_w]
-                        gen_grad_x = gen_grad_x[:, :, :min_h, :min_w]
-                        gen_grad_y = gen_grad_y[:, :, :min_h, :min_w]
-                        
-                        gradient_consistency_loss = (
-                            torch.mean((mask_grad_x - gen_grad_x) ** 2) + 
-                            torch.mean((mask_grad_y - gen_grad_y) ** 2)
-                        ) * 5.0
-                        
-                        # 4. Binary mask guidance - ensure fluorescence is concentrated in high-distance areas
-                        # Create binary mask from distance transform (threshold at 75th percentile)
-                        mask_flat = mask_norm.view(batch_size, -1)
-                        threshold = torch.quantile(mask_flat, 0.75, dim=1, keepdim=True).unsqueeze(-1).unsqueeze(-1)
-                        binary_mask = (mask_norm > threshold).float()
-                        
-                        # Fluorescence should be higher in binary mask areas
-                        inside_fluorescence = torch.mean(gen_norm * binary_mask)
-                        outside_fluorescence = torch.mean(gen_norm * (1 - binary_mask))
-                        binary_guidance_loss = -(inside_fluorescence - outside_fluorescence) * 8.0
-                        
-                        # Combine all mask consistency losses
-                        mask_consistency_loss = (mask_consistency_loss + distance_consistency_loss + 
-                                               gradient_consistency_loss + binary_guidance_loss)
+                    # Combine all mask consistency losses
+                    mask_consistency_loss = (distance_proportional_loss + membrane_intensity_loss + 
+                                           background_suppression_loss)
                     
                     # Adversarial loss - discriminator should think generated is real
                     d_output_fake = discriminator(generated_fluorescent, condition_masks)
@@ -756,8 +711,8 @@ def main():
                     valid_labels = torch.full((batch_size,), 0.9, device=device)
                     adversarial_loss = adversarial_criterion(d_output_fake, valid_labels)
                     
-                    # Combined generator loss with better feature learning
-                    g_loss = adversarial_loss + total_feature_loss + mask_consistency_loss
+                    # CELLSYNTHESIS-STYLE GENERATOR LOSS: Identity + Adversarial + Distance
+                    g_loss = (adversarial_loss + identity_loss + feature_matching_loss + mask_consistency_loss) / 4
                     g_loss.backward()
                     g_optimizer.step()
                     
@@ -807,14 +762,14 @@ def main():
                     epoch_d_loss += d_loss.item()
                     epoch_g_loss += g_loss.item()
                     epoch_adv_loss += adversarial_loss.item()
-                    epoch_identity_loss += total_feature_loss.item()  # Track total feature matching
+                    epoch_identity_loss += feature_matching_loss.item()  # Track feature matching
                     num_batches += 1
                     
                     if batch_idx % 10 == 0:
                         print(f"  Epoch [{epoch+1}/{args.num_epochs}] Batch [{batch_idx}/{len(dataloader)}] "
                               f"D_loss: {d_loss.item():.4f}, G_loss: {g_loss.item():.4f}, "
-                              f"Adv_loss: {adversarial_loss.item():.4f}, Feature_loss: {total_feature_loss.item():.4f}, "
-                              f"Mask_consistency: {mask_consistency_loss.item():.4f}")
+                              f"Adv_loss: {adversarial_loss.item():.4f}, Feature_loss: {feature_matching_loss.item():.4f}, "
+                              f"Identity_loss: {identity_loss.item():.4f}, Mask_consistency: {mask_consistency_loss.item():.4f}")
                 
                 # Epoch summary
                 avg_d_loss = epoch_d_loss / num_batches
