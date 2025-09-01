@@ -506,7 +506,7 @@ def main():
                        help='Directory to save outputs')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training')
     parser.add_argument('--num_epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.0002, help='Learning rate')
     parser.add_argument('--device', type=str, default='auto', help='Device to use (cuda/mps/cpu/auto)')
     parser.add_argument('--model_type', type=str, default='complex', choices=['simple', 'complex'],
                        help='Type of model to use')
@@ -608,9 +608,9 @@ def main():
             
             print(f"Initialized {args.model_type} models on {device}")
             
-            # Initialize optimizers with different learning rates
+            # Initialize optimizers with balanced learning rates
             g_optimizer = torch.optim.Adam(generator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))
-            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate*0.5, betas=(0.5, 0.999))  # Lower LR for discriminator
+            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))  # Same LR for balanced training
             
             # Loss functions
             adversarial_criterion = nn.BCELoss()
@@ -618,7 +618,7 @@ def main():
             
             print(f"Starting unpaired training...")
             print(f"Batch size: {args.batch_size}, Epochs: {args.num_epochs}")
-            print(f"Learning rate: {args.learning_rate} (G), {args.learning_rate*0.5} (D)")
+            print(f"Learning rate: {args.learning_rate} (G), {args.learning_rate} (D)")  # Same LR now
             
             # Simple training loop for unpaired data following CellSynthesis structure
             for epoch in range(args.num_epochs):
@@ -634,7 +634,7 @@ def main():
                     batch_size = real_fluorescent.size(0)
                     
                     # ============================================
-                    # Train Generator (following CellSynthesis structure)
+                    # Train Generator (improved feature learning)
                     # ============================================
                     g_optimizer.zero_grad()
                     
@@ -642,72 +642,92 @@ def main():
                     z = torch.randn(batch_size, 100, device=device)
                     generated_fluorescent = generator(z, condition_masks)
                     
-                    # Identity loss (structure preservation) - this encourages consistency
-                    # We want the generator to be somewhat consistent with the input structures
-                    # Use same noise but with real fluorescent as additional "guidance"
-                    z_identity = torch.randn(batch_size, 100, device=device)
-                    # In CellSynthesis, identity loss compares output when using real images vs synthetic
-                    # Here we'll use a simpler approach: L1 loss between generated and real to preserve structures
-                    identity_loss = identity_criterion(generated_fluorescent, real_fluorescent) * 0.1  # Weight it lower
+                    # Feature matching loss - encourage generated images to have realistic features
+                    # Extract features from real and generated images using discriminator
+                    with torch.no_grad():
+                        real_features = discriminator(real_fluorescent, condition_masks)
+                    fake_features = discriminator(generated_fluorescent, condition_masks)
+                    
+                    if real_features.dim() > 2:
+                        real_features = real_features.view(batch_size, -1)
+                        fake_features = fake_features.view(batch_size, -1)
+                    
+                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 10.0
+                    
+                    # Mask consistency loss - ensure generated content respects mask structure
+                    # Areas with high mask values should have higher fluorescent intensity
+                    mask_consistency_loss = 0.0
+                    if condition_masks.max() > condition_masks.min():  # Only if mask has variation
+                        # Normalize mask to [0,1] and generated to [0,1]
+                        mask_norm = (condition_masks - condition_masks.min()) / (condition_masks.max() - condition_masks.min() + 1e-8)
+                        gen_norm = (generated_fluorescent - generated_fluorescent.min()) / (generated_fluorescent.max() - generated_fluorescent.min() + 1e-8)
+                        
+                        # Correlation loss - high mask areas should correlate with high fluorescence
+                        mask_consistency_loss = -torch.mean(mask_norm * gen_norm) * 5.0
                     
                     # Adversarial loss - discriminator should think generated is real
-                    # Don't concatenate - our discriminator expects separate inputs
                     d_output_fake = discriminator(generated_fluorescent, condition_masks)
                     
                     # Flatten discriminator output if needed
                     if d_output_fake.dim() > 2:
                         d_output_fake = d_output_fake.view(batch_size, -1).mean(dim=1)
                     
-                    # Generator wants discriminator to output 1 (real)
-                    valid_labels = torch.ones(batch_size, device=device)
+                    # Use label smoothing for more stable training
+                    valid_labels = torch.full((batch_size,), 0.9, device=device)
                     adversarial_loss = adversarial_criterion(d_output_fake, valid_labels)
                     
-                    # Combined generator loss (like CellSynthesis)
-                    g_loss = adversarial_loss + identity_loss
+                    # Combined generator loss with better feature learning
+                    g_loss = adversarial_loss + feature_matching_loss + mask_consistency_loss
                     g_loss.backward()
                     g_optimizer.step()
                     
                     # ============================================
-                    # Train Discriminator (following CellSynthesis structure)
+                    # Train Discriminator (improved training)
                     # ============================================
                     d_optimizer.zero_grad()
                     
-                    # Real samples - don't concatenate, our discriminator takes separate inputs
+                    # Real samples - discriminator should output high values
                     d_output_real = discriminator(real_fluorescent, condition_masks)
                     
                     # Flatten discriminator output if needed
                     if d_output_real.dim() > 2:
                         d_output_real = d_output_real.view(batch_size, -1).mean(dim=1)
                     
-                    real_labels = torch.ones(batch_size, device=device)
+                    # Use label smoothing: real labels = 0.9 instead of 1.0
+                    real_labels = torch.full((batch_size,), 0.9, device=device)
                     d_real_loss = adversarial_criterion(d_output_real, real_labels)
                     
-                    # Fake samples - use detached generated images
+                    # Fake samples - discriminator should output low values
                     d_output_fake_for_d = discriminator(generated_fluorescent.detach(), condition_masks)
                     
                     # Flatten discriminator output if needed
                     if d_output_fake_for_d.dim() > 2:
                         d_output_fake_for_d = d_output_fake_for_d.view(batch_size, -1).mean(dim=1)
                     
-                    fake_labels = torch.zeros(batch_size, device=device)
+                    # Use label smoothing: fake labels = 0.1 instead of 0.0
+                    fake_labels = torch.full((batch_size,), 0.1, device=device)
                     d_fake_loss = adversarial_criterion(d_output_fake_for_d, fake_labels)
                     
                     # Combined discriminator loss
                     d_loss = (d_real_loss + d_fake_loss) / 2
                     d_loss.backward()
+                    
+                    # Gradient clipping to prevent discriminator from becoming too strong
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
+                    
                     d_optimizer.step()
                     
                     # Accumulate losses
                     epoch_d_loss += d_loss.item()
                     epoch_g_loss += g_loss.item()
                     epoch_adv_loss += adversarial_loss.item()
-                    epoch_identity_loss += identity_loss.item()
+                    epoch_identity_loss += feature_matching_loss.item()  # Track feature matching instead
                     num_batches += 1
                     
                     if batch_idx % 10 == 0:
                         print(f"  Epoch [{epoch+1}/{args.num_epochs}] Batch [{batch_idx}/{len(dataloader)}] "
                               f"D_loss: {d_loss.item():.4f}, G_loss: {g_loss.item():.4f}, "
-                              f"Adv_loss: {adversarial_loss.item():.4f}, Identity_loss: {identity_loss.item():.4f}")
+                              f"Adv_loss: {adversarial_loss.item():.4f}, Feature_loss: {feature_matching_loss.item():.4f}")
                 
                 # Epoch summary
                 avg_d_loss = epoch_d_loss / num_batches
@@ -715,7 +735,7 @@ def main():
                 avg_adv_loss = epoch_adv_loss / num_batches
                 avg_identity_loss = epoch_identity_loss / num_batches
                 print(f"Epoch [{epoch+1}/{args.num_epochs}] Average D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}")
-                print(f"  Adversarial_loss: {avg_adv_loss:.4f}, Identity_loss: {avg_identity_loss:.4f}")
+                print(f"  Adversarial_loss: {avg_adv_loss:.4f}, Feature_matching_loss: {avg_identity_loss:.4f}")
                 
                 # Save models periodically (only at specified intervals, not every epoch)
                 if (epoch + 1) % args.save_frequency == 0:
@@ -728,6 +748,23 @@ def main():
                         sample_mask = condition_masks[:num_samples]  # Use first N masks from batch
                         sample_generated = generator(sample_z, sample_mask)
                         print(f"Generated sample shape: {sample_generated.shape}")
+                        
+                        # Print some statistics to monitor feature learning
+                        real_mean = real_fluorescent.mean().item()
+                        real_std = real_fluorescent.std().item()
+                        gen_mean = sample_generated.mean().item()
+                        gen_std = sample_generated.std().item()
+                        mask_mean = sample_mask.mean().item()
+                        
+                        print(f"Real fluorescent - Mean: {real_mean:.3f}, Std: {real_std:.3f}")
+                        print(f"Generated fluorescent - Mean: {gen_mean:.3f}, Std: {gen_std:.3f}")
+                        print(f"Mask mean: {mask_mean:.3f}")
+                        
+                        # Check if there's correlation between mask and generated content
+                        mask_flat = sample_mask.view(num_samples, -1)
+                        gen_flat = sample_generated.view(num_samples, -1)
+                        correlation = torch.corrcoef(torch.cat([mask_flat.mean(0, keepdim=True), gen_flat.mean(0, keepdim=True)]))[0,1]
+                        print(f"Mask-Generation correlation: {correlation:.3f}")
                         
                         # Save sample
                         from torchvision.utils import save_image

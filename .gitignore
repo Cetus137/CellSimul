@@ -3,7 +3,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-
+*.png
+*.pth
 *.tif
 *.tiff
 .DS_store
