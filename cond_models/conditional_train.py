@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
+import tifffile
 import os
 import argparse
 from datetime import datetime
@@ -655,10 +656,10 @@ def main():
                     # ENHANCED CONDITIONING APPROACH v2.0
                     # Key insight: The current approach has negative correlation - we need to fix this
                     
-                    # 1. STRONGER Identity Loss for Structure Preservation (increased weight)
+                    # 1. STRONGER Identity Loss for Structure Preservation (reduced weight)
                     real_fluorescent_as_condition = real_fluorescent
                     identity_fluorescent = generator(z, real_fluorescent_as_condition)
-                    identity_loss = nn.L1Loss()(identity_fluorescent, real_fluorescent) * 100.0  # Doubled weight
+                    identity_loss = nn.L1Loss()(identity_fluorescent, real_fluorescent) * 10.0  # Reduced from 100.0
                     
                     # 2. DIRECT CORRELATION ENFORCEMENT
                     # The problem: we're getting negative correlation, so let's directly enforce positive correlation
@@ -675,7 +676,7 @@ def main():
                     correlation = torch.sum(mask_centered * gen_centered, dim=1) / (mask_std * gen_std + 1e-8)
                     
                     # Maximize positive correlation (penalize negative correlation heavily)
-                    correlation_loss = torch.mean(torch.clamp(1.0 - correlation, min=0.0)) * 75.0
+                    correlation_loss = torch.mean(torch.clamp(1.0 - correlation, min=0.0)) * 15.0  # Reduced from 75.0
                     
                     # 3. INTENSITY RATIO ENFORCEMENT
                     # High mask regions should have significantly higher intensity than low mask regions
@@ -694,11 +695,11 @@ def main():
                     low_intensity = torch.sum(gen_norm * low_mask_regions, dim=[1,2,3]) / (torch.sum(low_mask_regions, dim=[1,2,3]) + 1e-8)
                     
                     # Enforce high_intensity > low_intensity with margin
-                    intensity_ratio_loss = torch.mean(F.relu(low_intensity - high_intensity + 0.2)) * 50.0
+                    intensity_ratio_loss = torch.mean(F.relu(low_intensity - high_intensity + 0.2)) * 5.0  # Reduced from 50.0
                     
                     # 4. DIRECT INTENSITY MAPPING
                     # Force generated intensities to follow mask values more directly
-                    direct_mapping_loss = nn.MSELoss()(gen_norm, mask_norm) * 30.0
+                    direct_mapping_loss = nn.MSELoss()(gen_norm, mask_norm) * 3.0  # Reduced from 30.0
                     
                     # 5. Feature matching loss (reduced weight to focus on conditioning)
                     with torch.no_grad():
@@ -709,7 +710,7 @@ def main():
                         real_features = real_features.view(batch_size, -1)
                         fake_features = fake_features.view(batch_size, -1)
                     
-                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 10.0  # Reduced weight
+                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 1.0  # Further reduced weight
                     
                     # Combine conditioning losses
                     mask_consistency_loss = (correlation_loss + intensity_ratio_loss + direct_mapping_loss)
@@ -731,6 +732,10 @@ def main():
                     # CELLSYNTHESIS-STYLE GENERATOR LOSS: Identity + Adversarial + Distance
                     g_loss = (adversarial_loss + identity_loss + feature_matching_loss + mask_consistency_loss) / 4
                     g_loss.backward()
+                    
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+                    
                     g_optimizer.step()
                     
                     # ============================================
@@ -875,18 +880,51 @@ def main():
                             print(f"Sample {i+1} - High/Low intensity ratio: {intensity_ratio:.3f} "
                                   f"(should be > 1.0 for good conditioning)")
                         
-                        # Save sample generated images
-                        from torchvision.utils import save_image
-                        save_image(sample_generated, 
-                                  os.path.join(args.output_dir, f'unpaired_sample_epoch_{epoch+1}.png'),
-                                  normalize=True, nrow=2)
+                        # Save sample generated images as TIF
+                        import tifffile
                         
-                        # Save input masks that were used to create the samples
-                        save_image(sample_mask, 
-                                  os.path.join(args.output_dir, f'unpaired_masks_epoch_{epoch+1}.png'),
-                                  normalize=True, nrow=2)
+                        # Convert tensor to numpy and save each sample individually as TIF
+                        sample_generated_np = sample_generated.cpu().numpy()
+                        sample_mask_np = sample_mask.cpu().numpy()
                         
-                        print(f"Sample images and input masks saved at epoch {epoch+1}")
+                        for i in range(num_samples):
+                            # Save generated image (normalize from [-1,1] to [0,255])
+                            gen_img = sample_generated_np[i, 0]  # Remove channel dimension
+                            gen_img_normalized = ((gen_img + 1.0) * 127.5).astype(np.uint8)
+                            gen_save_path = os.path.join(args.output_dir, f'unpaired_sample_epoch_{epoch+1}_img_{i+1}.tif')
+                            tifffile.imwrite(gen_save_path, gen_img_normalized)
+                            
+                            # Save input mask (normalize from [-1,1] to [0,255])
+                            mask_img = sample_mask_np[i, 0]  # Remove channel dimension  
+                            mask_img_normalized = ((mask_img + 1.0) * 127.5).astype(np.uint8)
+                            mask_save_path = os.path.join(args.output_dir, f'unpaired_mask_epoch_{epoch+1}_img_{i+1}.tif')
+                            tifffile.imwrite(mask_save_path, mask_img_normalized)
+                        
+                        # Also create a combined visualization as TIF for easy viewing
+                        import matplotlib.pyplot as plt
+                        fig, axes = plt.subplots(2, num_samples, figsize=(num_samples*3, 6))
+                        if num_samples == 1:
+                            axes = axes.reshape(2, 1)
+                        
+                        for i in range(num_samples):
+                            # Generated images
+                            gen_img = sample_generated_np[i, 0]
+                            axes[0, i].imshow(gen_img, cmap='gray', vmin=-1, vmax=1)
+                            axes[0, i].set_title(f'Generated {i+1}')
+                            axes[0, i].axis('off')
+                            
+                            # Input masks
+                            mask_img = sample_mask_np[i, 0]
+                            axes[1, i].imshow(mask_img, cmap='gray', vmin=-1, vmax=1)
+                            axes[1, i].set_title(f'Input Mask {i+1}')
+                            axes[1, i].axis('off')
+                        
+                        plt.tight_layout()
+                        combined_save_path = os.path.join(args.output_dir, f'unpaired_combined_epoch_{epoch+1}.tif')
+                        plt.savefig(combined_save_path, dpi=150, bbox_inches='tight', format='tiff')
+                        plt.close()
+                        
+                        print(f"Sample images and input masks saved as TIF files at epoch {epoch+1}")
                     generator.train()
             
             # Save final models only at the very end
