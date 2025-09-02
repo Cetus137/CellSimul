@@ -619,9 +619,9 @@ def main():
             
             print(f"Initialized {args.model_type} models on {device}")
             
-            # Initialize optimizers with balanced learning rates
+            # Initialize optimizers with unbalanced learning rates to prevent discriminator dominance
             g_optimizer = torch.optim.Adam(generator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))
-            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))  # Same LR for balanced training
+            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate * 0.2, betas=(0.5, 0.999))  # Much lower LR for discriminator
             
             # Loss functions
             adversarial_criterion = nn.BCELoss()
@@ -746,14 +746,19 @@ def main():
                     # If D_loss is consistently low, skip discriminator training
                     train_discriminator = True
                     if batch_idx > 10:  # After some initial training
-                        if d_loss.item() < 0.35:  # Discriminator is too strong
-                            train_discriminator = (batch_idx % 3 == 0)  # Train D every 3rd iteration
+                        if d_loss.item() < 0.6:  # More aggressive threshold: increased from 0.35 to 0.6
+                            train_discriminator = (batch_idx % 8 == 0)  # Train D only every 8th iteration (was 3rd)
                     
                     if train_discriminator:
                         d_optimizer.zero_grad()
                         
+                        # Add noise to discriminator inputs to reduce overconfidence
+                        noise_std = 0.05
+                        real_fluorescent_noisy = real_fluorescent + torch.randn_like(real_fluorescent) * noise_std
+                        generated_fluorescent_noisy = generated_fluorescent.detach() + torch.randn_like(generated_fluorescent) * noise_std
+                        
                         # Real samples - discriminator should output high values
-                        d_output_real = discriminator(real_fluorescent, condition_masks)
+                        d_output_real = discriminator(real_fluorescent_noisy, condition_masks)
                         
                         # Clamp discriminator output to prevent rounding errors
                         d_output_real = torch.clamp(d_output_real, 1e-7, 1-1e-7)
@@ -767,7 +772,7 @@ def main():
                         d_real_loss = adversarial_criterion(d_output_real, real_labels)
                         
                         # Fake samples - discriminator should output low values
-                        d_output_fake_for_d = discriminator(generated_fluorescent.detach(), condition_masks)
+                        d_output_fake_for_d = discriminator(generated_fluorescent_noisy, condition_masks)
                         
                         # Clamp discriminator output to prevent rounding errors
                         d_output_fake_for_d = torch.clamp(d_output_fake_for_d, 1e-7, 1-1e-7)
