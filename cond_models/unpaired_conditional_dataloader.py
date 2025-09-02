@@ -86,7 +86,7 @@ class UnpairedConditionalImageDataset(Dataset):
                 transforms.Resize((image_size, image_size)),
                 transforms.Grayscale(num_output_channels=1),
                 transforms.ToTensor(),
-                # Distance masks should be in [0, 1] range already
+                transforms.Normalize([0.5], [0.5])  # Normalize to [-1, 1] like fluorescent images
             ])
         else:
             self.fluorescent_transform = transform
@@ -123,8 +123,8 @@ class UnpairedConditionalImageDataset(Dataset):
             mask_image = self._load_image(mask_path)
             mask_tensor = self.mask_transform(mask_image)
             
-            # Ensure mask values are in [0, 1] range for distance transforms
-            mask_tensor = torch.clamp(mask_tensor, 0, 1)
+            # Masks are now normalized to [-1, 1] range like fluorescent images
+            # Keep them in this range for consistency
             
             return fluorescent_tensor, mask_tensor
             
@@ -132,7 +132,7 @@ class UnpairedConditionalImageDataset(Dataset):
             print(f"Error loading images {fluorescent_path}, {mask_path}: {e}")
             # Return blank images if loading fails
             blank_fluorescent = torch.zeros(1, self.image_size, self.image_size)
-            blank_mask = torch.zeros(1, self.image_size, self.image_size)
+            blank_mask = torch.full((1, self.image_size, self.image_size), -1.0)  # -1 for background in [-1,1] range
             return blank_fluorescent, blank_mask
     
     def _load_image(self, image_path):
