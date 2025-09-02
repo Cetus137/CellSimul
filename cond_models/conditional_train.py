@@ -739,60 +739,72 @@ def main():
                     g_optimizer.step()
                     
                     # ============================================
-                    # Train Discriminator (improved training)
+                    # Train Discriminator (with frequency control)
                     # ============================================
-                    d_optimizer.zero_grad()
                     
-                    # Real samples - discriminator should output high values
-                    d_output_real = discriminator(real_fluorescent, condition_masks)
+                    # Only train discriminator if it's not too strong
+                    # If D_loss is consistently low, skip discriminator training
+                    train_discriminator = True
+                    if batch_idx > 10:  # After some initial training
+                        if d_loss.item() < 0.35:  # Discriminator is too strong
+                            train_discriminator = (batch_idx % 3 == 0)  # Train D every 3rd iteration
                     
-                    # Clamp discriminator output to prevent rounding errors
-                    d_output_real = torch.clamp(d_output_real, 1e-7, 1-1e-7)
+                    if train_discriminator:
+                        d_optimizer.zero_grad()
+                        
+                        # Real samples - discriminator should output high values
+                        d_output_real = discriminator(real_fluorescent, condition_masks)
+                        
+                        # Clamp discriminator output to prevent rounding errors
+                        d_output_real = torch.clamp(d_output_real, 1e-7, 1-1e-7)
+                        
+                        # Flatten discriminator output if needed
+                        if d_output_real.dim() > 2:
+                            d_output_real = d_output_real.view(batch_size, -1).mean(dim=1)
+                        
+                        # Use label smoothing: real labels = 0.9 instead of 1.0
+                        real_labels = torch.full((batch_size,), 0.9, device=device)
+                        d_real_loss = adversarial_criterion(d_output_real, real_labels)
+                        
+                        # Fake samples - discriminator should output low values
+                        d_output_fake_for_d = discriminator(generated_fluorescent.detach(), condition_masks)
+                        
+                        # Clamp discriminator output to prevent rounding errors
+                        d_output_fake_for_d = torch.clamp(d_output_fake_for_d, 1e-7, 1-1e-7)
+                        
+                        # Flatten discriminator output if needed
+                        if d_output_fake_for_d.dim() > 2:
+                            d_output_fake_for_d = d_output_fake_for_d.view(batch_size, -1).mean(dim=1)
+                        
+                        # Use label smoothing: fake labels = 0.1 instead of 0.0
+                        fake_labels = torch.full((batch_size,), 0.1, device=device)
+                        d_fake_loss = adversarial_criterion(d_output_fake_for_d, fake_labels)
+                        
+                        # Combined discriminator loss
+                        d_loss = (d_real_loss + d_fake_loss) / 2
+                        d_loss.backward()
+                        
+                        # Gradient clipping to prevent discriminator from becoming too strong
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 0.5)  # Reduced clipping
+                        
+                        d_optimizer.step()
                     
-                    # Flatten discriminator output if needed
-                    if d_output_real.dim() > 2:
-                        d_output_real = d_output_real.view(batch_size, -1).mean(dim=1)
-                    
-                    # Use label smoothing: real labels = 0.9 instead of 1.0
-                    real_labels = torch.full((batch_size,), 0.9, device=device)
-                    d_real_loss = adversarial_criterion(d_output_real, real_labels)
-                    
-                    # Fake samples - discriminator should output low values
-                    d_output_fake_for_d = discriminator(generated_fluorescent.detach(), condition_masks)
-                    
-                    # Clamp discriminator output to prevent rounding errors
-                    d_output_fake_for_d = torch.clamp(d_output_fake_for_d, 1e-7, 1-1e-7)
-                    
-                    # Flatten discriminator output if needed
-                    if d_output_fake_for_d.dim() > 2:
-                        d_output_fake_for_d = d_output_fake_for_d.view(batch_size, -1).mean(dim=1)
-                    
-                    # Use label smoothing: fake labels = 0.1 instead of 0.0
-                    fake_labels = torch.full((batch_size,), 0.1, device=device)
-                    d_fake_loss = adversarial_criterion(d_output_fake_for_d, fake_labels)
-                    
-                    # Combined discriminator loss
-                    d_loss = (d_real_loss + d_fake_loss) / 2
-                    d_loss.backward()
-                    
-                    # Gradient clipping to prevent discriminator from becoming too strong
-                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
-                    
-                    d_optimizer.step()
-                    
-                    # Accumulate losses
-                    epoch_d_loss += d_loss.item()
+                    # Accumulate losses (only accumulate d_loss if discriminator was trained)
+                    if train_discriminator:
+                        epoch_d_loss += d_loss.item()
                     epoch_g_loss += g_loss.item()
                     epoch_adv_loss += adversarial_loss.item()
                     epoch_identity_loss += identity_loss.item()  # Track identity loss
                     num_batches += 1
                     
                     if batch_idx % 10 == 0:
+                        d_loss_str = f"{d_loss.item():.4f}" if train_discriminator else "SKIP"
+                        train_status = " [D_SKIP]" if not train_discriminator else ""
                         print(f"  Epoch [{epoch+1}/{args.num_epochs}] Batch [{batch_idx}/{len(dataloader)}] "
-                              f"D_loss: {d_loss.item():.4f}, G_loss: {g_loss.item():.4f}, "
+                              f"D_loss: {d_loss_str}, G_loss: {g_loss.item():.4f}, "
                               f"Adv_loss: {adversarial_loss.item():.4f}, Feature_loss: {feature_matching_loss.item():.4f}, "
                               f"Identity_loss: {identity_loss.item():.4f}, Correlation_loss: {correlation_loss.item():.4f}, "
-                              f"Intensity_ratio: {intensity_ratio_loss.item():.4f}, Direct_mapping: {direct_mapping_loss.item():.4f}")
+                              f"Intensity_ratio: {intensity_ratio_loss.item():.4f}, Direct_mapping: {direct_mapping_loss.item():.4f}{train_status}")
                 
                 # Epoch summary
                 avg_d_loss = epoch_d_loss / num_batches
@@ -832,7 +844,7 @@ def main():
                         
                         print(f"Real fluorescent - Mean: {real_mean:.3f}, Std: {real_std:.3f}")
                         print(f"Generated fluorescent - Mean: {gen_mean:.3f}, Std: {gen_std:.3f}")
-                        print(f"Mask mean: {mask_mean:.3f}")
+                        print(f"Mask mean: {mask_mean:.3f} (normalized [-1,1] range)")
                         
                         # Check if there's correlation between mask and generated content
                         mask_flat = sample_mask.view(num_samples, -1)

@@ -86,7 +86,7 @@ class ConditionalImageDataset(Dataset):
                 transforms.Resize((image_size, image_size)),
                 transforms.Grayscale(num_output_channels=1),
                 transforms.ToTensor(),
-                # Keep masks as [0, 1] binary values
+                transforms.Normalize([0.5], [0.5])  # Normalize to [-1, 1] like fluorescent images
             ])
         else:
             self.fluorescent_transform = transform
@@ -116,8 +116,10 @@ class ConditionalImageDataset(Dataset):
             mask_image = self._load_image(mask_path)
             mask_tensor = self.mask_transform(mask_image)
             
-            # Ensure mask is binary (0 or 1)
-            mask_tensor = (mask_tensor > 0.5).float()
+            # Ensure mask is binary (-1 or 1) since we normalized to [-1, 1]
+            # Convert back to [0,1], threshold, then back to [-1,1]
+            mask_binary = ((mask_tensor + 1.0) / 2.0 > 0.5).float()  # Convert to [0,1], threshold
+            mask_tensor = mask_binary * 2.0 - 1.0  # Convert back to [-1,1]
             
             return fluorescent_tensor, mask_tensor
             
@@ -125,7 +127,7 @@ class ConditionalImageDataset(Dataset):
             print(f"Error loading image pair {fluorescent_path}, {mask_path}: {e}")
             # Return blank images if loading fails
             blank_fluorescent = torch.zeros(1, self.image_size, self.image_size)
-            blank_mask = torch.zeros(1, self.image_size, self.image_size)
+            blank_mask = torch.full((1, self.image_size, self.image_size), -1.0)  # -1 for background in [-1,1] range
             return blank_fluorescent, blank_mask
     
     def _load_image(self, image_path):
@@ -260,6 +262,7 @@ class SingleDirectoryConditionalDataset(Dataset):
             transforms.Resize((image_size, image_size)),
             transforms.Grayscale(num_output_channels=1),
             transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])  # Normalize to [-1, 1] like fluorescent images
         ])
     
     def _extract_base_name(self, filepath, pattern):
@@ -286,12 +289,16 @@ class SingleDirectoryConditionalDataset(Dataset):
             
             fluorescent_tensor = self.fluorescent_transform(fluorescent_image)
             mask_tensor = self.mask_transform(mask_image)
-            mask_tensor = (mask_tensor > 0.5).float()
+            
+            # Ensure mask is binary (-1 or 1) since we normalized to [-1, 1]
+            # Convert back to [0,1], threshold, then back to [-1,1]
+            mask_binary = ((mask_tensor + 1.0) / 2.0 > 0.5).float()  # Convert to [0,1], threshold
+            mask_tensor = mask_binary * 2.0 - 1.0  # Convert back to [-1,1]
             
             return fluorescent_tensor, mask_tensor
             
         except Exception as e:
             print(f"Error loading pair {fluorescent_path}, {mask_path}: {e}")
             blank_fluorescent = torch.zeros(1, self.image_size, self.image_size)
-            blank_mask = torch.zeros(1, self.image_size, self.image_size)
+            blank_mask = torch.full((1, self.image_size, self.image_size), -1.0)  # -1 for background in [-1,1] range
             return blank_fluorescent, blank_mask
