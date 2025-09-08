@@ -141,101 +141,95 @@ class StructuralLoss(nn.Module):
     """Improved structural loss to enforce meaningful mask-fluorescent correspondence"""
     def __init__(self):
         super(StructuralLoss, self).__init__()
+        self._debug_count = 0
         
-    def forward(self, generated_fluorescent, masks):
+    def forward(self, fluorescent, masks):
         """
-        Compute structural loss using multiple complementary approaches.
-        
-        Args:
-            generated_fluorescent: Generated fluorescent images [B, 1, H, W]
-            masks: Distance mask conditions [B, 1, H, W]
+        Revolutionary structural loss designed to vary dramatically based on actual conditioning quality:
+        1. Raw correlation without normalization (preserves natural variation)
+        2. Spatial gradient alignment (detects edge correspondence)  
+        3. Intensity distribution matching (histogram-based)
         """
-        batch_size = generated_fluorescent.size(0)
-        
-        # Debug: Check actual value ranges
-        if hasattr(self, '_debug_count'):
-            self._debug_count += 1
-        else:
-            self._debug_count = 1
-            
-        if self._debug_count <= 3:  # Only print first few times
-            print(f"DEBUG Structural Loss:")
-            print(f"  Mask range: [{masks.min().item():.4f}, {masks.max().item():.4f}]")
-            print(f"  Fluorescent range: [{generated_fluorescent.min().item():.4f}, {generated_fluorescent.max().item():.4f}]")
-            print(f"  Mask std: {masks.std().item():.4f}")
-            print(f"  Fluorescent std: {generated_fluorescent.std().item():.4f}")
-        
-        # Approach 1: Simple monotonic relationship
-        # Convert from [-1, 1] to [0, 1] range for both
-        masks_norm = (masks + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
-        fluor_norm = (generated_fluorescent + 1.0) / 2.0
-        
-        # Check if masks have meaningful variation
-        mask_variation = masks_norm.std()
-        if mask_variation < 0.01:
-            # If masks have very little variation, this might be the problem
-            if self._debug_count <= 3:
-                print(f"  WARNING: Low mask variation: {mask_variation:.6f}")
-        
-        # Direct MSE with a simple linear relationship
-        # High mask values should produce high fluorescent values
-        simple_loss = F.mse_loss(fluor_norm, masks_norm)
-        
-        # Approach 2: Rank correlation for relative ordering
-        fluor_flat = generated_fluorescent.view(batch_size, -1)
-        mask_flat = masks.view(batch_size, -1)
-        
-        rank_loss = 0.0
-        for b in range(batch_size):
-            # Sample a subset for efficiency (every 16th pixel)
-            indices = torch.arange(0, fluor_flat.size(1), 16, device=fluor_flat.device)
-            fluor_sample = fluor_flat[b][indices]
-            mask_sample = mask_flat[b][indices]
-            
-            # Sort by mask values
-            sorted_indices = torch.argsort(mask_sample)
-            fluor_sorted = fluor_sample[sorted_indices]
-            
-            # Check if fluorescent values are also sorted
-            # Use differences between consecutive elements
-            fluor_diffs = fluor_sorted[1:] - fluor_sorted[:-1]
-            # We want most differences to be positive (ascending)
-            rank_loss += torch.relu(-fluor_diffs).mean()  # Penalize descending
-        
-        rank_loss = rank_loss / batch_size
-        
-        # Approach 3: Extrema matching
-        # High mask regions should have high fluorescent, low mask should have low fluorescent
-        # Find top 10% and bottom 10% of mask values
-        mask_flat_norm = masks_norm.view(batch_size, -1)
-        fluor_flat_norm = fluor_norm.view(batch_size, -1)
-        
-        extrema_loss = 0.0
-        for b in range(batch_size):
-            n_pixels = mask_flat_norm.size(1)
-            k = max(1, n_pixels // 10)  # Top/bottom 10%
-            
-            # Top k mask locations should have high fluorescent
-            _, top_mask_indices = torch.topk(mask_flat_norm[b], k)
-            top_fluor_values = fluor_flat_norm[b][top_mask_indices]
-            top_loss = F.mse_loss(top_fluor_values, torch.ones_like(top_fluor_values) * 0.8)
-            
-            # Bottom k mask locations should have low fluorescent  
-            _, bottom_mask_indices = torch.topk(mask_flat_norm[b], k, largest=False)
-            bottom_fluor_values = fluor_flat_norm[b][bottom_mask_indices]
-            bottom_loss = F.mse_loss(bottom_fluor_values, torch.ones_like(bottom_fluor_values) * 0.2)
-            
-            extrema_loss += (top_loss + bottom_loss)
-        
-        extrema_loss = extrema_loss / batch_size
-        
-        # Combine all approaches
-        total_loss = simple_loss + rank_loss + extrema_loss
+        batch_size = fluorescent.size(0)
         
         if self._debug_count <= 3:
-            print(f"  Simple loss: {simple_loss.item():.4f}")
-            print(f"  Rank loss: {rank_loss.item():.4f}")
-            print(f"  Extrema loss: {extrema_loss.item():.4f}")
+            print(f"DEBUG Structural Loss:")
+            print(f"  Mask range: [{masks.min().item():.4f}, {masks.max().item():.4f}]")
+            print(f"  Fluorescent range: [{fluorescent.min().item():.4f}, {fluorescent.max().item():.4f}]")
+            print(f"  Mask std: {masks.std().item():.4f}")
+            print(f"  Fluorescent std: {fluorescent.std().item():.4f}")
+            self._debug_count += 1
+        
+        # Approach 1: Raw Pearson correlation (no normalization to preserve variation)
+        # This should vary dramatically: 0.0 for random images, 1.0+ for perfect correlation
+        correlation_loss = 0.0
+        for b in range(batch_size):
+            mask_flat = masks[b].view(-1)
+            fluor_flat = fluorescent[b].view(-1)
+            
+            # Remove mean for correlation calculation
+            mask_centered = mask_flat - mask_flat.mean()
+            fluor_centered = fluor_flat - fluor_flat.mean()
+            
+            # Pearson correlation coefficient
+            numerator = (mask_centered * fluor_centered).sum()
+            denominator = torch.sqrt((mask_centered ** 2).sum() * (fluor_centered ** 2).sum())
+            
+            if denominator > 1e-8:
+                correlation = numerator / denominator
+                # Convert to loss: 0 for perfect correlation, higher for poor correlation
+                correlation_loss += (1.0 - correlation) ** 2
+            else:
+                correlation_loss += 2.0  # Maximum penalty for degenerate case
+        
+        correlation_loss = correlation_loss / batch_size
+        
+        # Approach 2: Spatial gradient alignment
+        # Good conditioning should have aligned gradients between mask and fluorescent
+        def compute_gradients(x):
+            grad_x = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])  # Horizontal gradients
+            grad_y = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])  # Vertical gradients
+            return grad_x, grad_y
+        
+        mask_grad_x, mask_grad_y = compute_gradients(masks)
+        fluor_grad_x, fluor_grad_y = compute_gradients(fluorescent)
+        
+        # Cosine similarity between gradient vectors
+        grad_alignment_x = F.cosine_similarity(mask_grad_x.view(batch_size, -1), 
+                                              fluor_grad_x.view(batch_size, -1), dim=1)
+        grad_alignment_y = F.cosine_similarity(mask_grad_y.view(batch_size, -1), 
+                                              fluor_grad_y.view(batch_size, -1), dim=1)
+        
+        gradient_loss = (2.0 - grad_alignment_x.mean() - grad_alignment_y.mean())
+        
+        # Approach 3: Intensity distribution matching using Earth Mover's Distance approximation
+        # Create histograms and compare distributions
+        histogram_loss = 0.0
+        for b in range(batch_size):
+            # Create normalized histograms
+            mask_hist = torch.histc(masks[b], bins=50, min=-1.0, max=1.0)
+            fluor_hist = torch.histc(fluorescent[b], bins=50, min=-1.0, max=1.0)
+            
+            # Normalize to probability distributions
+            mask_hist = mask_hist / (mask_hist.sum() + 1e-8)
+            fluor_hist = fluor_hist / (fluor_hist.sum() + 1e-8)
+            
+            # Wasserstein-1 distance approximation (cumulative distribution difference)
+            mask_cdf = torch.cumsum(mask_hist, dim=0)
+            fluor_cdf = torch.cumsum(fluor_hist, dim=0)
+            
+            histogram_loss += torch.abs(mask_cdf - fluor_cdf).mean()
+        
+        histogram_loss = histogram_loss / batch_size
+        
+        # Combine with different weights to ensure variation
+        # Correlation loss dominates (0-4 range), gradients add detail (0-2 range), histogram adds distribution matching (0-1 range)
+        total_loss = 2.0 * correlation_loss + 1.0 * gradient_loss + 0.5 * histogram_loss
+        
+        if self._debug_count <= 3:
+            print(f"  Correlation loss: {correlation_loss.item():.4f}")
+            print(f"  Gradient loss: {gradient_loss.item():.4f}")
+            print(f"  Histogram loss: {histogram_loss.item():.4f}")
             print(f"  Total loss: {total_loss.item():.4f}")
         
         return total_loss
@@ -455,8 +449,8 @@ class ConditionalGANTrainer:
         g_structural_loss = self.structural_loss(fake_fluorescent, masks)
         
         # Make structural loss dominant to force proper conditioning
-        # Reduce competing losses to ensure structural guidance takes priority
-        g_loss = 0.3 * g_adv_loss + 0.1 * g_identity_loss + 2.0 * g_structural_loss
+        # Start with moderate weight to see variation, then can increase
+        g_loss = 0.4 * g_adv_loss + 0.1 * g_identity_loss + 1.0 * g_structural_loss
         
         return {
             'loss': g_loss,
@@ -703,16 +697,33 @@ class ConditionalGANTrainer:
             
             print(f"Generated fluorescent range: [{fake_fluorescent.min():.3f}, {fake_fluorescent.max():.3f}]")
             
-            # Save comparison: masks -> real_fluorescent -> generated_fluorescent
+            # Create overlay visualization (mask in red, generated in green)
+            # Normalize both to [0, 1] for visualization
+            masks_vis = (masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+            fake_vis = (fake_fluorescent + 1.0) / 2.0
+            
+            # Create RGB overlay: Red channel = mask, Green channel = generated fluorescent
+            batch_size = masks.size(0)
+            overlay = torch.zeros(batch_size, 3, masks.size(2), masks.size(3))
+            overlay[:, 0, :, :] = masks_vis.squeeze(1)  # Red channel = masks
+            overlay[:, 1, :, :] = fake_vis.squeeze(1)   # Green channel = generated
+            overlay[:, 2, :, :] = 0.0                   # Blue channel = empty
+            
+            # Save comparison: masks -> real_fluorescent -> generated_fluorescent -> overlay
             comparison = torch.cat([
                 masks.cpu(),
                 real_fluorescent.cpu(),
-                fake_fluorescent.cpu()
+                fake_fluorescent.cpu(),
+                overlay.cpu()
             ], dim=0)
             
             save_path = os.path.join(output_dir, f'samples_epoch_{epoch+1}.png')
             save_image(comparison, save_path, nrow=masks.size(0), normalize=True)
             print(f"Saved samples to {save_path}")
+            print(f"  Row 1: Distance masks (white = far from membrane)")
+            print(f"  Row 2: Real fluorescent images")
+            print(f"  Row 3: Generated fluorescent images")
+            print(f"  Row 4: Overlay (Red = mask, Green = generated, Yellow = overlap)")
     
     def save_models(self, output_dir, epoch):
         """Save model checkpoints"""
