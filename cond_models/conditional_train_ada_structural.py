@@ -144,7 +144,9 @@ class StructuralLoss(nn.Module):
         
     def forward(self, generated_fluorescent, masks):
         """
-        Enforce that fluorescent intensity meaningfully correlates with mask structure
+        Compute structural loss between generated fluorescent images and masks.
+        Uses a simpler, more direct approach focused on the core relationship:
+        fluorescent intensity should be higher where mask distance values are higher.
         
         Args:
             generated_fluorescent: Generated fluorescent images [B, 1, H, W]
@@ -154,65 +156,34 @@ class StructuralLoss(nn.Module):
         masks_norm = (masks + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
         fluor_norm = (generated_fluorescent + 1.0) / 2.0
         
-        # Loss 1: Correlation loss - encourage positive correlation between mask and fluorescent
-        # Use Pearson correlation coefficient approach
-        mask_flat = masks_norm.view(masks_norm.size(0), -1)  # [B, H*W]
-        fluor_flat = fluor_norm.view(fluor_norm.size(0), -1)  # [B, H*W]
+        # Primary Loss: Direct correlation - high mask values should produce high fluorescent values
+        # Use a more direct approach: MSE between scaled mask and fluorescent
+        # Scale mask to encourage stronger fluorescent response
+        target_fluorescent = masks_norm * 0.7 + 0.2  # Map [0,1] mask to [0.2, 0.9] target
+        direct_loss = F.mse_loss(fluor_norm, target_fluorescent)
         
-        # Calculate correlation for each sample in batch
-        correlation_losses = []
-        for i in range(mask_flat.size(0)):
-            mask_centered = mask_flat[i] - mask_flat[i].mean()
-            fluor_centered = fluor_flat[i] - fluor_flat[i].mean()
-            
-            # Correlation coefficient (closer to 1 is better)
-            correlation = (mask_centered * fluor_centered).sum() / (
-                torch.sqrt((mask_centered ** 2).sum() * (fluor_centered ** 2).sum()) + 1e-8
-            )
-            # Convert to loss (1 - correlation, so minimizing increases correlation)
-            correlation_losses.append(1.0 - correlation)
+        # Secondary Loss: Consistency loss - similar mask regions should have similar fluorescent values
+        # Create neighborhood comparison to encourage spatial consistency
+        # Use average pooling to get local neighborhood values
+        avg_pool = F.avg_pool2d(fluor_norm, kernel_size=5, stride=1, padding=2)
+        avg_mask = F.avg_pool2d(masks_norm, kernel_size=5, stride=1, padding=2)
         
-        correlation_loss = torch.stack(correlation_losses).mean()
+        # Penalize when local fluorescent average doesn't match local mask average
+        consistency_loss = F.mse_loss(avg_pool, avg_mask * 0.7 + 0.2)
         
-        # Loss 2: Edge consistency - fluorescent edges should align with mask edges
-        # Sobel edge detection
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=masks.device)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=masks.device)
-        sobel_x = sobel_x.view(1, 1, 3, 3)
-        sobel_y = sobel_y.view(1, 1, 3, 3)
+        # Tertiary Loss: Edge preservation - maintain structure boundaries
+        # Simple gradient magnitude comparison
+        fluor_grad_x = torch.abs(fluor_norm[:, :, :, 1:] - fluor_norm[:, :, :, :-1])
+        fluor_grad_y = torch.abs(fluor_norm[:, :, 1:, :] - fluor_norm[:, :, :-1, :])
+        mask_grad_x = torch.abs(masks_norm[:, :, :, 1:] - masks_norm[:, :, :, :-1])
+        mask_grad_y = torch.abs(masks_norm[:, :, 1:, :] - masks_norm[:, :, :-1, :])
         
-        # Calculate edges for masks and fluorescent
-        mask_edges_x = F.conv2d(masks_norm, sobel_x, padding=1)
-        mask_edges_y = F.conv2d(masks_norm, sobel_y, padding=1)
-        mask_edges = torch.sqrt(mask_edges_x**2 + mask_edges_y**2 + 1e-8)
+        edge_loss_x = F.mse_loss(fluor_grad_x, mask_grad_x)
+        edge_loss_y = F.mse_loss(fluor_grad_y, mask_grad_y)
+        edge_loss = (edge_loss_x + edge_loss_y) / 2.0
         
-        fluor_edges_x = F.conv2d(fluor_norm, sobel_x, padding=1)
-        fluor_edges_y = F.conv2d(fluor_norm, sobel_y, padding=1)
-        fluor_edges = torch.sqrt(fluor_edges_x**2 + fluor_edges_y**2 + 1e-8)
-        
-        # Edge alignment loss
-        edge_loss = F.mse_loss(fluor_edges, mask_edges)
-        
-        # Loss 3: Intensity consistency - areas with similar mask values should have similar fluorescent values
-        # Use adaptive thresholding based on mask statistics
-        mask_mean = masks_norm.mean(dim=(2, 3), keepdim=True)
-        mask_std = masks_norm.std(dim=(2, 3), keepdim=True)
-        
-        # High intensity regions (above mean + 0.5*std)
-        high_mask = (masks_norm > (mask_mean + 0.5 * mask_std)).float()
-        # Low intensity regions (below mean - 0.5*std)  
-        low_mask = (masks_norm < (mask_mean - 0.5 * mask_std)).float()
-        
-        # Encourage high fluorescent in high mask regions, low fluorescent in low mask regions
-        high_region_loss = F.mse_loss(fluor_norm * high_mask, 
-                                    torch.ones_like(fluor_norm) * high_mask * 0.8)
-        low_region_loss = F.mse_loss(fluor_norm * low_mask, 
-                                   torch.zeros_like(fluor_norm) * low_mask)
-        
-        intensity_loss = high_region_loss + low_region_loss
-        
-        # Combined structural loss with balanced weighting
-        total_loss = correlation_loss + 0.5 * edge_loss + 0.3 * intensity_loss
+        # Combined loss with emphasis on direct correlation
+        total_loss = 2.0 * direct_loss + 0.5 * consistency_loss + 0.3 * edge_loss
         
         return total_loss
 
@@ -248,7 +219,7 @@ class ConditionalGANTrainer:
     
     def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
                  lr_g=0.0002, lr_d=0.0002, device=None, use_simple_models=False,
-                 ada_target=0.5, ada_update=0.05):
+                 ada_target=0.3, ada_update=0.05):
         """
         Initialize the conditional GAN trainer with structural loss
         """
@@ -430,9 +401,9 @@ class ConditionalGANTrainer:
         # Structural loss - enforce mask-fluorescent correspondence  
         g_structural_loss = self.structural_loss(fake_fluorescent, masks)
         
-        # CellSynthesis-style balanced loss with meaningful structural guidance
-        # Increase structural loss weight to ensure it actually influences training
-        g_loss = (g_adv_loss + g_identity_loss) / 2.0 + 0.5 * g_structural_loss
+        # CellSynthesis-style balanced loss with strong structural guidance
+        # Increase structural loss weight to ensure proper conditioning
+        g_loss = (g_adv_loss + g_identity_loss) / 2.0 + 1.0 * g_structural_loss
         
         return {
             'loss': g_loss,
@@ -795,7 +766,7 @@ def main():
                       help='Latent dimension')
     parser.add_argument('--image_size', type=int, default=256,
                       help='Image size')
-    parser.add_argument('--ada_target', type=float, default=0.5,
+    parser.add_argument('--ada_target', type=float, default=0.3,
                       help='ADA target accuracy (reduced for better conditioning)')
     parser.add_argument('--ada_update', type=float, default=0.05,
                       help='ADA update step size (CellSynthesis default)')
