@@ -1,8 +1,10 @@
 """
 Conditional GAN Training Script for Fluorescent Microscopy Images
+Inspired by CellSynthesis: https://github.com/stegmaierj/CellSynthesis
 
 This script trains a conditional GAN to generate fluorescent cell images
-conditioned on binary cell membrane segmentation masks.
+conditioned on binary cell membrane segmentation masks using PyTorch Lightning
+with Adaptive Discriminator Augmentation (ADA) for stable training.
 """
 
 import torch
@@ -14,7 +16,9 @@ import matplotlib.pyplot as plt
 import tifffile
 import os
 import argparse
+import json
 from datetime import datetime
+from collections import OrderedDict
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from PIL import Image
@@ -769,8 +773,8 @@ def main():
                     # Use current_d_loss instead of stale d_loss from previous batch
                     train_discriminator = True
                     if batch_idx > 5:  # Start control earlier
-                        if current_d_loss.item() < 0.8:  # More aggressive threshold: 0.8 to target current 0.5 equilibrium
-                            train_discriminator = (batch_idx % 16 == 0)  # Train D only every 16th iteration for stronger control
+                        if current_d_loss.item() < 1.2:  # Even more aggressive threshold: 1.2 to target current 0.6 equilibrium
+                            train_discriminator = (batch_idx % 20 == 0)  # Train D only every 20th iteration for stronger control
                     
                     if train_discriminator:
                         d_optimizer.zero_grad()
