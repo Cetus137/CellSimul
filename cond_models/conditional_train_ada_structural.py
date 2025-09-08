@@ -248,7 +248,7 @@ class ConditionalGANTrainer:
     
     def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
                  lr_g=0.0002, lr_d=0.0002, device=None, use_simple_models=False,
-                 ada_target=0.6, ada_update=0.05):
+                 ada_target=0.5, ada_update=0.05):
         """
         Initialize the conditional GAN trainer with structural loss
         """
@@ -474,8 +474,13 @@ class ConditionalGANTrainer:
         fake_labels = torch.zeros_like(fake_pred)
         d_fake_loss = F.binary_cross_entropy_with_logits(fake_pred, fake_labels)
         
-        # CellSynthesis-style discriminator loss: average of real and fake losses
-        d_loss = (d_real_loss + d_fake_loss) / 2.0
+        # Add mask-mismatch penalty to encourage conditioning awareness
+        # If fake image has high intensity where mask is low, penalize discriminator
+        # This forces discriminator to see mask-fluorescent correlations
+        mask_mismatch_penalty = self._compute_mask_mismatch_penalty(fake_fluorescent, masks)
+        
+        # CellSynthesis-style discriminator loss: average of real and fake losses + mask penalty
+        d_loss = (d_real_loss + d_fake_loss) / 2.0 + 0.1 * mask_mismatch_penalty
         
         # Update ADA based on real predictions
         ada_prob = self.ada.update(real_pred, epoch=self.current_epoch)
@@ -493,6 +498,25 @@ class ConditionalGANTrainer:
             'd_fake_loss': d_fake_loss.item(),
             'ada_prob': ada_prob
         }
+    
+    def _compute_mask_mismatch_penalty(self, fake_fluorescent, masks):
+        """
+        Compute penalty when fake fluorescent images don't match mask conditioning.
+        This encourages the discriminator to notice when images violate mask structure.
+        """
+        # Normalize both to [0, 1] for comparison
+        fake_norm = (fake_fluorescent - fake_fluorescent.min()) / (fake_fluorescent.max() - fake_fluorescent.min() + 1e-8)
+        mask_norm = (masks - masks.min()) / (masks.max() - masks.min() + 1e-8)
+        
+        # Compute mismatch: high intensity where mask is low is bad
+        # Use a threshold to identify mismatches
+        fake_high = (fake_norm > 0.5).float()
+        mask_low = (mask_norm < 0.3).float()
+        
+        # Penalty for high fluorescent signal where mask indicates it shouldn't be
+        mismatch = (fake_high * mask_low).mean()
+        
+        return mismatch
     
     def _compute_gradient_penalty(self, real_images, fake_images, masks):
         """Compute gradient penalty for WGAN-GP style regularization"""
@@ -771,8 +795,8 @@ def main():
                       help='Latent dimension')
     parser.add_argument('--image_size', type=int, default=256,
                       help='Image size')
-    parser.add_argument('--ada_target', type=float, default=0.6,
-                      help='ADA target accuracy (CellSynthesis default)')
+    parser.add_argument('--ada_target', type=float, default=0.5,
+                      help='ADA target accuracy (reduced for better conditioning)')
     parser.add_argument('--ada_update', type=float, default=0.05,
                       help='ADA update step size (CellSynthesis default)')
     parser.add_argument('--use_simple_models', action='store_true',
