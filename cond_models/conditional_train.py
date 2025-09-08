@@ -621,7 +621,7 @@ def main():
             
             # Initialize optimizers with unbalanced learning rates to prevent discriminator dominance
             g_optimizer = torch.optim.Adam(generator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))
-            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate * 0.1, betas=(0.5, 0.999))  # Even lower LR: 0.1x instead of 0.2x
+            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate * 0.05, betas=(0.5, 0.999))  # Even more aggressive: 0.05x instead of 0.1x
             
             # Loss functions
             adversarial_criterion = nn.BCELoss()
@@ -629,7 +629,7 @@ def main():
             
             print(f"Starting unpaired training...")
             print(f"Batch size: {args.batch_size}, Epochs: {args.num_epochs}")
-            print(f"Learning rate: {args.learning_rate} (G), {args.learning_rate * 0.1} (D)")  # Updated LR info
+            print(f"Learning rate: {args.learning_rate} (G), {args.learning_rate * 0.05} (D)")  # Updated LR info
             
             # Progressive discriminator weakening scheduler
             d_scheduler = torch.optim.lr_scheduler.ExponentialLR(d_optimizer, gamma=0.99)  # Decay D LR by 1% each epoch
@@ -759,8 +759,8 @@ def main():
                             d_output_fake_check = d_output_fake_check.view(batch_size, -1).mean(dim=1)
                         
                         # Calculate current d_loss for condition checking with same aggressive smoothing
-                        real_labels_check = torch.full((batch_size,), 0.8, device=device)  # Match training labels
-                        fake_labels_check = torch.full((batch_size,), 0.2, device=device)  # Match training labels
+                        real_labels_check = torch.full((batch_size,), 0.7, device=device)  # Match training labels
+                        fake_labels_check = torch.full((batch_size,), 0.3, device=device)  # Match training labels
                         d_real_loss_check = adversarial_criterion(torch.clamp(d_output_real_check, 1e-7, 1-1e-7), real_labels_check)
                         d_fake_loss_check = adversarial_criterion(torch.clamp(d_output_fake_check, 1e-7, 1-1e-7), fake_labels_check)
                         current_d_loss = (d_real_loss_check + d_fake_loss_check) / 2
@@ -769,8 +769,8 @@ def main():
                     # Use current_d_loss instead of stale d_loss from previous batch
                     train_discriminator = True
                     if batch_idx > 5:  # Start control earlier
-                        if current_d_loss.item() < 1.0:  # Much more aggressive threshold: 1.0 instead of 0.6
-                            train_discriminator = (batch_idx % 12 == 0)  # Train D only every 12th iteration (was 8th)
+                        if current_d_loss.item() < 0.8:  # More aggressive threshold: 0.8 to target current 0.5 equilibrium
+                            train_discriminator = (batch_idx % 16 == 0)  # Train D only every 16th iteration for stronger control
                     
                     if train_discriminator:
                         d_optimizer.zero_grad()
@@ -793,8 +793,8 @@ def main():
                         if d_output_real.dim() > 2:
                             d_output_real = d_output_real.view(batch_size, -1).mean(dim=1)
                         
-                        # Use more aggressive label smoothing: real labels = 0.8 instead of 0.9
-                        real_labels = torch.full((batch_size,), 0.8, device=device)
+                        # Use even more aggressive label smoothing: real labels = 0.7 instead of 0.8
+                        real_labels = torch.full((batch_size,), 0.7, device=device)
                         d_real_loss = adversarial_criterion(d_output_real, real_labels)
                         
                         # Fake samples - discriminator should output low values
@@ -807,8 +807,8 @@ def main():
                         if d_output_fake_for_d.dim() > 2:
                             d_output_fake_for_d = d_output_fake_for_d.view(batch_size, -1).mean(dim=1)
                         
-                        # Use more aggressive label smoothing: fake labels = 0.2 instead of 0.1
-                        fake_labels = torch.full((batch_size,), 0.2, device=device)
+                        # Use even more aggressive label smoothing: fake labels = 0.3 instead of 0.2
+                        fake_labels = torch.full((batch_size,), 0.3, device=device)
                         d_fake_loss = adversarial_criterion(d_output_fake_for_d, fake_labels)
                         
                         # Combined discriminator loss
