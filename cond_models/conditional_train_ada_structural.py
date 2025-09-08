@@ -97,10 +97,10 @@ class MaskOnlyDataset(torch.utils.data.Dataset):
 
 class AdaptiveDiscriminatorAugmentation:
     """
-    Adaptive Discriminator Augmentation (ADA) for stabilizing GAN training
-    Based on CellSynthesis implementation with dynamic target adjustment
+    Ultra-Conservative Adaptive Discriminator Augmentation (ADA) for stable GAN training
+    Prevents discriminator collapse by limiting maximum augmentation
     """
-    def __init__(self, ada_target=0.5, ada_update=0.01, ada_update_period=4):
+    def __init__(self, ada_target=0.6, ada_update=0.01, ada_update_period=4):
         self.ada_target = ada_target
         self.initial_target = ada_target  # Store initial target
         self.ada_update = ada_update
@@ -109,15 +109,14 @@ class AdaptiveDiscriminatorAugmentation:
         self.ada_step = 0
         self.ada_stats = []
         self.epoch_count = 0
+        self.max_aug_prob = 0.7  # Conservative cap at 70%
         
     def update(self, real_predictions, epoch=None):
         """Update ADA probability based on discriminator accuracy on real images"""
         if epoch is not None:
             self.epoch_count = epoch
-            # Dynamic target: start low, gradually increase
-            # This prevents ADA from getting stuck at 1.0 too early
-            progress = min(1.0, epoch / 50.0)  # Reach full target after 50 epochs
-            self.ada_target = self.initial_target + progress * 0.2  # Gradually increase
+            # Keep target stable to prevent runaway augmentation
+            self.ada_target = self.initial_target  # No dynamic increase
             
         with torch.no_grad():
             # Calculate accuracy on real images
@@ -127,9 +126,9 @@ class AdaptiveDiscriminatorAugmentation:
             if len(self.ada_stats) >= self.ada_update_period:
                 mean_accuracy = np.mean(self.ada_stats)
                 
-                # Adjust augmentation probability based on accuracy
+                # Adjust augmentation probability based on accuracy with conservative cap
                 if mean_accuracy > self.ada_target:
-                    self.ada_aug_p = min(1.0, self.ada_aug_p + self.ada_update)
+                    self.ada_aug_p = min(self.max_aug_prob, self.ada_aug_p + self.ada_update)  # Cap at max_aug_prob
                 else:
                     self.ada_aug_p = max(0.0, self.ada_aug_p - self.ada_update)
                 
@@ -139,40 +138,81 @@ class AdaptiveDiscriminatorAugmentation:
 
 
 class StructuralLoss(nn.Module):
-    """Structural loss to enforce mask-fluorescent correspondence"""
+    """Improved structural loss to enforce meaningful mask-fluorescent correspondence"""
     def __init__(self):
         super(StructuralLoss, self).__init__()
         
     def forward(self, generated_fluorescent, masks):
         """
-        Enforce that fluorescent intensity correlates with mask structure
+        Enforce that fluorescent intensity meaningfully correlates with mask structure
         
         Args:
             generated_fluorescent: Generated fluorescent images [B, 1, H, W]
             masks: Distance mask conditions [B, 1, H, W]
         """
-        # Normalize masks to [0, 1] range
+        # Normalize both to [0, 1] range for consistent comparison
         masks_norm = (masks + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
-        
-        # Normalize generated fluorescent to [0, 1] range
         fluor_norm = (generated_fluorescent + 1.0) / 2.0
         
-        # Loss 1: Fluorescent intensity should correlate with mask values
-        # Higher mask values (closer to cell membrane) should have higher fluorescent intensity
-        correlation_loss = F.mse_loss(fluor_norm * masks_norm, masks_norm * 0.8)
+        # Loss 1: Correlation loss - encourage positive correlation between mask and fluorescent
+        # Use Pearson correlation coefficient approach
+        mask_flat = masks_norm.view(masks_norm.size(0), -1)  # [B, H*W]
+        fluor_flat = fluor_norm.view(fluor_norm.size(0), -1)  # [B, H*W]
         
-        # Loss 2: Fluorescent should be minimal where mask is minimal (background)
-        background_mask = (masks_norm < 0.1).float()  # Background regions
-        background_loss = F.mse_loss(fluor_norm * background_mask, 
-                                   torch.zeros_like(fluor_norm) * background_mask)
+        # Calculate correlation for each sample in batch
+        correlation_losses = []
+        for i in range(mask_flat.size(0)):
+            mask_centered = mask_flat[i] - mask_flat[i].mean()
+            fluor_centered = fluor_flat[i] - fluor_flat[i].mean()
+            
+            # Correlation coefficient (closer to 1 is better)
+            correlation = (mask_centered * fluor_centered).sum() / (
+                torch.sqrt((mask_centered ** 2).sum() * (fluor_centered ** 2).sum()) + 1e-8
+            )
+            # Convert to loss (1 - correlation, so minimizing increases correlation)
+            correlation_losses.append(1.0 - correlation)
         
-        # Loss 3: Fluorescent should be strong where mask is strong (membrane regions)
-        membrane_mask = (masks_norm > 0.7).float()  # Membrane regions
-        membrane_loss = F.mse_loss(fluor_norm * membrane_mask, 
-                                 masks_norm * membrane_mask)
+        correlation_loss = torch.stack(correlation_losses).mean()
         
-        # Combined structural loss
-        total_loss = correlation_loss + 2.0 * background_loss + membrane_loss
+        # Loss 2: Edge consistency - fluorescent edges should align with mask edges
+        # Sobel edge detection
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=masks.device)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=masks.device)
+        sobel_x = sobel_x.view(1, 1, 3, 3)
+        sobel_y = sobel_y.view(1, 1, 3, 3)
+        
+        # Calculate edges for masks and fluorescent
+        mask_edges_x = F.conv2d(masks_norm, sobel_x, padding=1)
+        mask_edges_y = F.conv2d(masks_norm, sobel_y, padding=1)
+        mask_edges = torch.sqrt(mask_edges_x**2 + mask_edges_y**2 + 1e-8)
+        
+        fluor_edges_x = F.conv2d(fluor_norm, sobel_x, padding=1)
+        fluor_edges_y = F.conv2d(fluor_norm, sobel_y, padding=1)
+        fluor_edges = torch.sqrt(fluor_edges_x**2 + fluor_edges_y**2 + 1e-8)
+        
+        # Edge alignment loss
+        edge_loss = F.mse_loss(fluor_edges, mask_edges)
+        
+        # Loss 3: Intensity consistency - areas with similar mask values should have similar fluorescent values
+        # Use adaptive thresholding based on mask statistics
+        mask_mean = masks_norm.mean(dim=(2, 3), keepdim=True)
+        mask_std = masks_norm.std(dim=(2, 3), keepdim=True)
+        
+        # High intensity regions (above mean + 0.5*std)
+        high_mask = (masks_norm > (mask_mean + 0.5 * mask_std)).float()
+        # Low intensity regions (below mean - 0.5*std)  
+        low_mask = (masks_norm < (mask_mean - 0.5 * mask_std)).float()
+        
+        # Encourage high fluorescent in high mask regions, low fluorescent in low mask regions
+        high_region_loss = F.mse_loss(fluor_norm * high_mask, 
+                                    torch.ones_like(fluor_norm) * high_mask * 0.8)
+        low_region_loss = F.mse_loss(fluor_norm * low_mask, 
+                                   torch.zeros_like(fluor_norm) * low_mask)
+        
+        intensity_loss = high_region_loss + low_region_loss
+        
+        # Combined structural loss with balanced weighting
+        total_loss = correlation_loss + 0.5 * edge_loss + 0.3 * intensity_loss
         
         return total_loss
 
@@ -274,38 +314,53 @@ class ConditionalGANTrainer:
         self.identity_loss = IdentityLoss()
         self.structural_loss = StructuralLoss()  # NEW: Structural loss for conditioning
         
-        # Optimizers - CellSynthesis RAdam with balanced single learning rate
-        # Use balanced learning rate (average of G and D LRs) for both
-        balanced_lr = (lr_g + lr_d) / 2.0
+        # Optimizers - CellSynthesis RAdam with ultra-conservative learning rates
+        # Use the passed learning rates or ultra-conservative defaults
+        lr_g = self.lr_g if self.lr_g else 0.0001
+        lr_d = self.lr_d if self.lr_d else 0.0001
         
         try:
             # Try to import RAdam from CellSynthesis approach
             from torch.optim import RAdam
-            self.optimizer_G = RAdam(self.generator.parameters(), lr=balanced_lr)
-            self.optimizer_D = RAdam(self.discriminator.parameters(), lr=balanced_lr)
-            print(f"Using RAdam optimizer with balanced LR: {balanced_lr}")
+            self.optimizer_G = RAdam(self.generator.parameters(), lr=lr_g, weight_decay=1e-4)
+            self.optimizer_D = RAdam(self.discriminator.parameters(), lr=lr_d, weight_decay=1e-4)
+            print(f"Using RAdam optimizer with ultra-conservative LR: G={lr_g}, D={lr_d}")
         except ImportError:
             # Fallback to Adam with CellSynthesis-like settings
             self.optimizer_G = torch.optim.Adam(
                 self.generator.parameters(), 
-                lr=balanced_lr, 
-                betas=(0.5, 0.999)  # Standard GAN betas
+                lr=lr_g, 
+                betas=(0.5, 0.999),  # Standard GAN betas
+                weight_decay=1e-4
             )
             self.optimizer_D = torch.optim.Adam(
                 self.discriminator.parameters(), 
-                lr=balanced_lr, 
-                betas=(0.5, 0.999)
+                lr=lr_d, 
+                betas=(0.5, 0.999),
+                weight_decay=1e-4
             )
-            print(f"Using Adam optimizer with balanced LR: {balanced_lr}")
+            print(f"Using Adam optimizer with ultra-conservative LR: G={lr_g}, D={lr_d}")
             
-        # Store the actual LR used
-        self.actual_lr = balanced_lr
+        # Store the actual LRs used
+        self.actual_lr_g = lr_g
+        self.actual_lr_d = lr_d
         
-        # Initialize ADA with CellSynthesis-style epoch-based updates
+        # Initialize ADA with ultra-conservative settings  
+        self.ada_target = ada_target
+        self.ada_update = ada_update
+        
+        print(f"Initialized ConditionalGANTrainer with CellSynthesis-inspired approach:")
+        print(f"  Generator LR: {lr_g}")
+        print(f"  Discriminator LR: {lr_d}")
+        print(f"  ADA Target: {ada_target}")
+        print(f"  ADA Update: {ada_update}")
+        print(f"  ADA Update Period: 4 epochs (more stable)")
+        print(f"  Device: {self.device}")
+        
         self.ada = AdaptiveDiscriminatorAugmentation(
             ada_target=ada_target,
             ada_update=ada_update,
-            ada_update_period=1  # Update every epoch like CellSynthesis
+            ada_update_period=4  # Update every 4 epochs for stability (not every epoch)
         )
         
         # Training state
@@ -313,14 +368,6 @@ class ConditionalGANTrainer:
         self.g_losses = []
         self.d_losses = []
         self.ada_probs = []
-        
-        # Rebalanced training approach
-        print(f"Initialized ConditionalGANTrainer with CellSynthesis-inspired approach:")
-        print(f"  Balanced LR: {self.actual_lr} (for both G and D)")
-        print(f"  ADA Target: {ada_target}")
-        print(f"  ADA Update: {ada_update}")
-        print(f"  ADA Update Period: 1 epoch (CellSynthesis style)")
-        print(f"  Device: {self.device}")
     
     def _init_weights(self):
         """Initialize network weights"""
@@ -383,9 +430,9 @@ class ConditionalGANTrainer:
         # Structural loss - enforce mask-fluorescent correspondence  
         g_structural_loss = self.structural_loss(fake_fluorescent, masks)
         
-        # CellSynthesis-style balanced loss with proper weighting
-        # Reduce structural loss weight to prevent overwhelming adversarial training
-        g_loss = (g_adv_loss + g_identity_loss) / 2.0 + 0.1 * g_structural_loss
+        # CellSynthesis-style balanced loss with meaningful structural guidance
+        # Increase structural loss weight to ensure it actually influences training
+        g_loss = (g_adv_loss + g_identity_loss) / 2.0 + 0.5 * g_structural_loss
         
         return {
             'loss': g_loss,
@@ -432,6 +479,13 @@ class ConditionalGANTrainer:
         
         # Update ADA based on real predictions
         ada_prob = self.ada.update(real_pred, epoch=self.current_epoch)
+        
+        # Emergency ADA reset if discriminator becomes too weak
+        if d_loss.item() < 0.2:  # If discriminator loss is very low
+            self.ada.ada_aug_p = max(0.0, self.ada.ada_aug_p - 0.1)  # Reduce augmentation quickly
+            if d_loss.item() < 0.15:  # If extremely low
+                self.ada.ada_aug_p = 0.0  # Reset to no augmentation
+                print(f"WARNING: Discriminator too weak (loss={d_loss.item():.4f}), resetting ADA to 0.0")
         
         return {
             'loss': d_loss,
