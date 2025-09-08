@@ -98,18 +98,27 @@ class MaskOnlyDataset(torch.utils.data.Dataset):
 class AdaptiveDiscriminatorAugmentation:
     """
     Adaptive Discriminator Augmentation (ADA) for stabilizing GAN training
-    Based on CellSynthesis implementation
+    Based on CellSynthesis implementation with dynamic target adjustment
     """
-    def __init__(self, ada_target=0.7, ada_update=0.05, ada_update_period=4):
+    def __init__(self, ada_target=0.5, ada_update=0.01, ada_update_period=4):
         self.ada_target = ada_target
+        self.initial_target = ada_target  # Store initial target
         self.ada_update = ada_update
         self.ada_update_period = ada_update_period
         self.ada_aug_p = 0.0
         self.ada_step = 0
         self.ada_stats = []
+        self.epoch_count = 0
         
-    def update(self, real_predictions):
+    def update(self, real_predictions, epoch=None):
         """Update ADA probability based on discriminator accuracy on real images"""
+        if epoch is not None:
+            self.epoch_count = epoch
+            # Dynamic target: start low, gradually increase
+            # This prevents ADA from getting stuck at 1.0 too early
+            progress = min(1.0, epoch / 50.0)  # Reach full target after 50 epochs
+            self.ada_target = self.initial_target + progress * 0.2  # Gradually increase
+            
         with torch.no_grad():
             # Calculate accuracy on real images
             real_accuracy = (torch.sigmoid(real_predictions) > 0.5).float().mean().item()
@@ -198,7 +207,7 @@ class ConditionalGANTrainer:
     """
     
     def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
-                 lr_g=0.0001, lr_d=0.0002, device=None, use_simple_models=False,
+                 lr_g=0.0003, lr_d=0.0001, device=None, use_simple_models=False,
                  ada_target=0.5, ada_update=0.01):
         """
         Initialize the conditional GAN trainer with structural loss
@@ -283,14 +292,14 @@ class ConditionalGANTrainer:
         self.g_losses = []
         self.d_losses = []
         self.ada_probs = []
+        self.discriminator_train_freq = 1  # Start with normal frequency
         
-        # Aggressive rebalancing to prevent discriminator collapse
-        # Reduce generator LR, increase discriminator LR significantly
+        # Rebalanced learning rates to prevent discriminator dominance
         print(f"Initialized ConditionalGANTrainer:")
-        print(f"  Generator LR: {lr_g} (reduced to prevent overpowering discriminator)")
-        print(f"  Discriminator LR: {lr_d} (increased for stronger discriminator)")
-        print(f"  ADA Target: {ada_target} (reduced to 0.5 - easier target)")
-        print(f"  ADA Update: {ada_update} (reduced to 0.01 for very gentle adjustments)")
+        print(f"  Generator LR: {lr_g} (increased to prevent discriminator dominance)")
+        print(f"  Discriminator LR: {lr_d} (reduced to balance training)")
+        print(f"  ADA Target: {ada_target} (starting low, will increase to {ada_target + 0.2:.1f})")
+        print(f"  ADA Update: {ada_update} (reduced to {ada_update} for gentle adjustments)")
         print(f"  Device: {self.device}")
     
     def _init_weights(self):
@@ -369,20 +378,17 @@ class ConditionalGANTrainer:
         fake_pred = self.discriminator(fake_fluorescent, masks)
         d_fake_loss = self.adversarial_loss(fake_pred, target_is_real=False)
         
-        # Add gradient penalty for stability (prevents discriminator collapse)
-        gradient_penalty = self._compute_gradient_penalty(real_fluorescent, fake_fluorescent, masks)
-        
-        # Total discriminator loss with regularization
-        d_loss = (d_real_loss + d_fake_loss) / 2 + 0.1 * gradient_penalty
+        # Simplified training - remove gradient penalty for now to avoid complexity
+        # Total discriminator loss 
+        d_loss = (d_real_loss + d_fake_loss) / 2
         
         # Update ADA based on real predictions (without mask conditioning)
-        ada_prob = self.ada.update(real_pred)
+        ada_prob = self.ada.update(real_pred, epoch=self.current_epoch)
         
         return {
             'loss': d_loss,
             'd_real_loss': d_real_loss.item(),
             'd_fake_loss': d_fake_loss.item(),
-            'gradient_penalty': gradient_penalty.item(),
             'ada_prob': ada_prob
         }
     
@@ -429,13 +435,21 @@ class ConditionalGANTrainer:
             real_fluorescent, masks = [x.to(self.device) for x in batch]
             batch = (real_fluorescent, masks)
             
-            # Train discriminator
-            self.optimizer_D.zero_grad()
-            d_results = self.training_step(batch, optimizer_idx=1)
-            d_results['loss'].backward()
-            self.optimizer_D.step()
+            # Adaptive training: train discriminator less frequently if it's dominating
+            train_discriminator = (batch_idx % self.discriminator_train_freq == 0)
             
-            # Train generator
+            if train_discriminator:
+                # Train discriminator
+                self.optimizer_D.zero_grad()
+                d_results = self.training_step(batch, optimizer_idx=1)
+                d_results['loss'].backward()
+                self.optimizer_D.step()
+            else:
+                # Just get discriminator metrics without training
+                with torch.no_grad():
+                    d_results = self.training_step(batch, optimizer_idx=1)
+            
+            # Always train generator
             self.optimizer_G.zero_grad()
             g_results = self.training_step(batch, optimizer_idx=0)
             g_results['loss'].backward()
@@ -446,19 +460,47 @@ class ConditionalGANTrainer:
             epoch_d_loss += d_results['loss'].item()
             epoch_ada_prob += d_results['ada_prob']
             
-            # Print progress with structural loss
+            # Adjust discriminator training frequency based on loss ratio
+            if batch_idx > 0 and batch_idx % 25 == 0:
+                recent_g_loss = g_results['loss'].item()
+                recent_d_loss = d_results['loss'].item()
+                loss_ratio = recent_g_loss / (recent_d_loss + 1e-8)
+                
+                if loss_ratio > 2.0:  # Generator losing badly
+                    self.discriminator_train_freq = min(3, self.discriminator_train_freq + 1)
+                elif loss_ratio < 0.5:  # Discriminator losing
+                    self.discriminator_train_freq = max(1, self.discriminator_train_freq - 1)
+            
+            # Print progress with structural loss and dynamic ADA target
             if batch_idx % 50 == 0:
+                current_ada_target = self.ada.ada_target
+                d_freq_info = f"D_freq: {self.discriminator_train_freq}" if self.discriminator_train_freq > 1 else ""
                 print(f"Batch {batch_idx}/{num_batches}: "
                       f"G_loss: {g_results['loss'].item():.4f} "
                       f"(adv: {g_results['g_adv_loss']:.4f}, "
                       f"struct: {g_results['g_structural_loss']:.4f}), "
                       f"D_loss: {d_results['loss'].item():.4f}, "
-                      f"ADA_prob: {d_results['ada_prob']:.4f}")
+                      f"ADA_prob: {d_results['ada_prob']:.4f} "
+                      f"(target: {current_ada_target:.2f}) {d_freq_info}")
         
         # Average losses for the epoch
         avg_g_loss = epoch_g_loss / num_batches
         avg_d_loss = epoch_d_loss / num_batches
         avg_ada_prob = epoch_ada_prob / num_batches
+        
+        # Monitor training balance and adjust discriminator frequency
+        if len(self.g_losses) > 0:
+            prev_g_loss = self.g_losses[-1]
+            prev_d_loss = self.d_losses[-1]
+            
+            # Check if generator is struggling (loss increasing while discriminator decreasing)
+            if avg_g_loss > prev_g_loss * 1.1 and avg_d_loss < prev_d_loss * 0.9:
+                self.discriminator_train_freq = min(4, self.discriminator_train_freq + 1)
+                print(f"  Discriminator dominating - reducing D training frequency to 1/{self.discriminator_train_freq}")
+            elif avg_g_loss < prev_g_loss * 0.9 and avg_d_loss > prev_d_loss * 1.1:
+                self.discriminator_train_freq = max(1, self.discriminator_train_freq - 1)
+                if self.discriminator_train_freq == 1:
+                    print(f"  Training balanced - restored normal D training frequency")
         
         self.g_losses.append(avg_g_loss)
         self.d_losses.append(avg_d_loss)
@@ -502,11 +544,12 @@ class ConditionalGANTrainer:
             # Train one epoch
             epoch_results = self.train_epoch(dataloader)
             
-            # Print epoch results
+            # Print epoch results with dynamic ADA target info
+            current_ada_target = self.ada.ada_target
             print(f"\nEpoch {epoch+1}/{num_epochs}:")
             print(f"  Generator Loss: {epoch_results['g_loss']:.6f}")
             print(f"  Discriminator Loss: {epoch_results['d_loss']:.6f}")
-            print(f"  ADA Probability: {epoch_results['ada_prob']:.4f}")
+            print(f"  ADA Probability: {epoch_results['ada_prob']:.4f} (target: {current_ada_target:.2f})")
             
             # Save samples and models periodically
             if (epoch + 1) % save_interval == 0:
@@ -638,10 +681,10 @@ def main():
                       help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=16,
                       help='Batch size')
-    parser.add_argument('--lr_g', type=float, default=0.0002,
-                      help='Generator learning rate (increased to balance training)')
+    parser.add_argument('--lr_g', type=float, default=0.0003,
+                      help='Generator learning rate (increased to balance against discriminator)')
     parser.add_argument('--lr_d', type=float, default=0.0001,
-                      help='Discriminator learning rate (decreased to fix ADA=1.0)')
+                      help='Discriminator learning rate (reduced to prevent dominance)')
     parser.add_argument('--latent_dim', type=int, default=100,
                       help='Latent dimension')
     parser.add_argument('--image_size', type=int, default=256,
