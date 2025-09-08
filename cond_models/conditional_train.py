@@ -621,7 +621,7 @@ def main():
             
             # Initialize optimizers with unbalanced learning rates to prevent discriminator dominance
             g_optimizer = torch.optim.Adam(generator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))
-            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate * 0.2, betas=(0.5, 0.999))  # Much lower LR for discriminator
+            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate * 0.1, betas=(0.5, 0.999))  # Even lower LR: 0.1x instead of 0.2x
             
             # Loss functions
             adversarial_criterion = nn.BCELoss()
@@ -629,7 +629,10 @@ def main():
             
             print(f"Starting unpaired training...")
             print(f"Batch size: {args.batch_size}, Epochs: {args.num_epochs}")
-            print(f"Learning rate: {args.learning_rate} (G), {args.learning_rate} (D)")  # Same LR now
+            print(f"Learning rate: {args.learning_rate} (G), {args.learning_rate * 0.1} (D)")  # Updated LR info
+            
+            # Progressive discriminator weakening scheduler
+            d_scheduler = torch.optim.lr_scheduler.ExponentialLR(d_optimizer, gamma=0.99)  # Decay D LR by 1% each epoch
             
             # Simple training loop for unpaired data following CellSynthesis structure
             for epoch in range(args.num_epochs):
@@ -656,10 +659,10 @@ def main():
                     # ENHANCED CONDITIONING APPROACH v2.0
                     # Key insight: The current approach has negative correlation - we need to fix this
                     
-                    # 1. STRONGER Identity Loss for Structure Preservation (reduced weight)
+                    # 1. WEAKER Identity Loss for Structure Preservation (further reduced weight)
                     real_fluorescent_as_condition = real_fluorescent
                     identity_fluorescent = generator(z, real_fluorescent_as_condition)
-                    identity_loss = nn.L1Loss()(identity_fluorescent, real_fluorescent) * 10.0  # Reduced from 100.0
+                    identity_loss = nn.L1Loss()(identity_fluorescent, real_fluorescent) * 3.0  # Reduced from 10.0
                     
                     # 2. DIRECT CORRELATION ENFORCEMENT
                     # The problem: we're getting negative correlation, so let's directly enforce positive correlation
@@ -675,8 +678,8 @@ def main():
                     gen_std = torch.sqrt(torch.sum(gen_centered ** 2, dim=1) + 1e-8)
                     correlation = torch.sum(mask_centered * gen_centered, dim=1) / (mask_std * gen_std + 1e-8)
                     
-                    # Maximize positive correlation (penalize negative correlation heavily)
-                    correlation_loss = torch.mean(torch.clamp(1.0 - correlation, min=0.0)) * 15.0  # Reduced from 75.0
+                    # Maximize positive correlation (penalize negative correlation more gently)
+                    correlation_loss = torch.mean(torch.clamp(1.0 - correlation, min=0.0)) * 5.0  # Reduced from 15.0
                     
                     # 3. INTENSITY RATIO ENFORCEMENT
                     # High mask regions should have significantly higher intensity than low mask regions
@@ -694,12 +697,12 @@ def main():
                     high_intensity = torch.sum(gen_norm * high_mask_regions, dim=[1,2,3]) / (torch.sum(high_mask_regions, dim=[1,2,3]) + 1e-8)
                     low_intensity = torch.sum(gen_norm * low_mask_regions, dim=[1,2,3]) / (torch.sum(low_mask_regions, dim=[1,2,3]) + 1e-8)
                     
-                    # Enforce high_intensity > low_intensity with margin
-                    intensity_ratio_loss = torch.mean(F.relu(low_intensity - high_intensity + 0.2)) * 5.0  # Reduced from 50.0
+                    # Enforce high_intensity > low_intensity with margin (gentler)
+                    intensity_ratio_loss = torch.mean(F.relu(low_intensity - high_intensity + 0.2)) * 2.0  # Reduced from 5.0
                     
-                    # 4. DIRECT INTENSITY MAPPING
-                    # Force generated intensities to follow mask values more directly
-                    direct_mapping_loss = nn.MSELoss()(gen_norm, mask_norm) * 3.0  # Reduced from 30.0
+                    # 4. WEAKER DIRECT INTENSITY MAPPING
+                    # Reduce direct mapping to allow more creative generation
+                    direct_mapping_loss = nn.MSELoss()(gen_norm, mask_norm) * 1.0  # Reduced from 3.0
                     
                     # 5. Feature matching loss (reduced weight to focus on conditioning)
                     with torch.no_grad():
@@ -710,7 +713,7 @@ def main():
                         real_features = real_features.view(batch_size, -1)
                         fake_features = fake_features.view(batch_size, -1)
                     
-                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 1.0  # Further reduced weight
+                    feature_matching_loss = nn.L1Loss()(fake_features, real_features) * 0.5  # Further reduced weight for more freedom
                     
                     # Combine conditioning losses
                     mask_consistency_loss = (correlation_loss + intensity_ratio_loss + direct_mapping_loss)
@@ -729,8 +732,9 @@ def main():
                     valid_labels = torch.full((batch_size,), 0.9, device=device)
                     adversarial_loss = adversarial_criterion(d_output_fake, valid_labels)
                     
-                    # CELLSYNTHESIS-STYLE GENERATOR LOSS: Identity + Adversarial + Distance
-                    g_loss = (adversarial_loss + identity_loss + feature_matching_loss + mask_consistency_loss) / 4
+                    # CELLSYNTHESIS-STYLE GENERATOR LOSS: Balance adversarial and conditioning
+                    # Increase adversarial weight relative to conditioning for more natural generation
+                    g_loss = (adversarial_loss * 2 + identity_loss + feature_matching_loss + mask_consistency_loss) / 5  # Give more weight to adversarial
                     g_loss.backward()
                     
                     # Gradient clipping for stability
@@ -754,9 +758,9 @@ def main():
                         if d_output_fake_check.dim() > 2:
                             d_output_fake_check = d_output_fake_check.view(batch_size, -1).mean(dim=1)
                         
-                        # Calculate current d_loss for condition checking
-                        real_labels_check = torch.full((batch_size,), 0.9, device=device)
-                        fake_labels_check = torch.full((batch_size,), 0.1, device=device)
+                        # Calculate current d_loss for condition checking with same aggressive smoothing
+                        real_labels_check = torch.full((batch_size,), 0.8, device=device)  # Match training labels
+                        fake_labels_check = torch.full((batch_size,), 0.2, device=device)  # Match training labels
                         d_real_loss_check = adversarial_criterion(torch.clamp(d_output_real_check, 1e-7, 1-1e-7), real_labels_check)
                         d_fake_loss_check = adversarial_criterion(torch.clamp(d_output_fake_check, 1e-7, 1-1e-7), fake_labels_check)
                         current_d_loss = (d_real_loss_check + d_fake_loss_check) / 2
@@ -764,17 +768,20 @@ def main():
                     # Only train discriminator if it's not too strong
                     # Use current_d_loss instead of stale d_loss from previous batch
                     train_discriminator = True
-                    if batch_idx > 10:  # After some initial training
-                        if current_d_loss.item() < 0.6:  # More aggressive threshold: increased from 0.35 to 0.6
-                            train_discriminator = (batch_idx % 8 == 0)  # Train D only every 8th iteration (was 3rd)
+                    if batch_idx > 5:  # Start control earlier
+                        if current_d_loss.item() < 1.0:  # Much more aggressive threshold: 1.0 instead of 0.6
+                            train_discriminator = (batch_idx % 12 == 0)  # Train D only every 12th iteration (was 8th)
                     
                     if train_discriminator:
                         d_optimizer.zero_grad()
                         
-                        # Add noise to discriminator inputs to reduce overconfidence
-                        noise_std = 0.05
+                        # Add more aggressive noise to discriminator inputs to reduce overconfidence
+                        noise_std = 0.1  # Increased from 0.05
                         real_fluorescent_noisy = real_fluorescent + torch.randn_like(real_fluorescent) * noise_std
                         generated_fluorescent_noisy = generated_fluorescent.detach() + torch.randn_like(generated_fluorescent) * noise_std
+                        
+                        # Set discriminator to training mode with dropout
+                        discriminator.train()
                         
                         # Real samples - discriminator should output high values
                         d_output_real = discriminator(real_fluorescent_noisy, condition_masks)
@@ -786,8 +793,8 @@ def main():
                         if d_output_real.dim() > 2:
                             d_output_real = d_output_real.view(batch_size, -1).mean(dim=1)
                         
-                        # Use label smoothing: real labels = 0.9 instead of 1.0
-                        real_labels = torch.full((batch_size,), 0.9, device=device)
+                        # Use more aggressive label smoothing: real labels = 0.8 instead of 0.9
+                        real_labels = torch.full((batch_size,), 0.8, device=device)
                         d_real_loss = adversarial_criterion(d_output_real, real_labels)
                         
                         # Fake samples - discriminator should output low values
@@ -800,8 +807,8 @@ def main():
                         if d_output_fake_for_d.dim() > 2:
                             d_output_fake_for_d = d_output_fake_for_d.view(batch_size, -1).mean(dim=1)
                         
-                        # Use label smoothing: fake labels = 0.1 instead of 0.0
-                        fake_labels = torch.full((batch_size,), 0.1, device=device)
+                        # Use more aggressive label smoothing: fake labels = 0.2 instead of 0.1
+                        fake_labels = torch.full((batch_size,), 0.2, device=device)
                         d_fake_loss = adversarial_criterion(d_output_fake_for_d, fake_labels)
                         
                         # Combined discriminator loss
@@ -836,8 +843,13 @@ def main():
                 avg_g_loss = epoch_g_loss / num_batches
                 avg_adv_loss = epoch_adv_loss / num_batches
                 avg_identity_loss = epoch_identity_loss / num_batches
+                
+                # Apply discriminator learning rate decay
+                d_scheduler.step()
+                current_d_lr = d_optimizer.param_groups[0]['lr']
+                
                 print(f"Epoch [{epoch+1}/{args.num_epochs}] Average D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}")
-                print(f"  Identity_loss: {avg_identity_loss:.4f}, Adversarial_loss: {avg_adv_loss:.4f}")
+                print(f"  Identity_loss: {avg_identity_loss:.4f}, Adversarial_loss: {avg_adv_loss:.4f}, D_LR: {current_d_lr:.6f}")
                 
                 # Save models periodically every 100 epochs (overwrite)
                 if (epoch + 1) % 100 == 0:
