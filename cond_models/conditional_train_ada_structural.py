@@ -697,16 +697,20 @@ class ConditionalGANTrainer:
             
             print(f"Generated fluorescent range: [{fake_fluorescent.min():.3f}, {fake_fluorescent.max():.3f}]")
             
-            # Create overlay visualization (normalized masks + generated images)
+            # Create red-green overlay visualization 
             # Normalize both to [0,1] for proper overlay
             masks_norm = (masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
             fake_norm = (fake_fluorescent + 1.0) / 2.0
             
-            # Create overlay by averaging normalized mask and generated fluorescent
-            # This shows where they align (bright) vs where they differ (darker)
-            overlay = (masks_norm + fake_norm) / 2.0
+            # Create RGB overlay: Red channel = masks, Green channel = generated
+            # Where they overlap, you'll see yellow/orange
+            batch_size = masks.size(0)
+            overlay = torch.zeros(batch_size, 3, masks.size(2), masks.size(3))
+            overlay[:, 0, :, :] = masks_norm.squeeze(1)  # Red channel = masks
+            overlay[:, 1, :, :] = fake_norm.squeeze(1)   # Green channel = generated
+            overlay[:, 2, :, :] = 0.0                    # Blue channel = empty
             
-            # Save comparison: real_fluorescent -> masks -> generated -> overlay
+            # Save comparison: real_fluorescent -> masks -> generated -> red-green overlay
             comparison = torch.cat([
                 real_fluorescent.cpu(),
                 masks.cpu(),
@@ -720,7 +724,7 @@ class ConditionalGANTrainer:
             print(f"  Row 1: Real fluorescent images (targets)")
             print(f"  Row 2: Distance masks (conditions - white = far from membrane)")
             print(f"  Row 3: Generated fluorescent images (from masks)")
-            print(f"  Row 4: Overlay (normalized masks + generated - bright = good alignment)")
+            print(f"  Row 4: Red-Green Overlay (Red = masks, Green = generated, Yellow = good alignment)")
     
     def save_models(self, output_dir, epoch):
         """Save model checkpoints"""
@@ -856,7 +860,7 @@ def main():
     trainer.train(
         num_epochs=args.epochs,
         batch_size=args.batch_size,
-        save_interval=1,  # Save every epoch to see progress
+        save_interval=10,  # Save every 10 epochs
         output_dir=args.output_dir
     )
 
