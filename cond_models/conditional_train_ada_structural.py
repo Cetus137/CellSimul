@@ -2,24 +2,8 @@
 Conditional GAN Training Script for Fluorescent Microscopy Images
 Inspired by CellSynthesis: https://github.com/stegmaierj/CellSynthesis
 
-This script trains a conditional GAN to generate fluores    def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
-                 lr_g=0.0002, lr_d=0.0001, device=None, use_simple_models=False,
-                 ada_target=0.7, ada_update=0.05):
-        """
-        Initialize the conditional GAN trainer
-        
-        Args:
-            fluorescent_dir (str): Directory containing real fluorescent images
-            mask_dir (str): Directory containing mask images (conditions)
-            latent_dim (int): Dimension of noise vector
-            image_size (int): Size of generated images (assumed square)
-            lr_g (float): Generator learning rate (increased)
-            lr_d (float): Discriminator learning rate (decreased to fix ADA=1.0)
-            device (str): Device to use for training
-            use_simple_models (bool): Whether to use simplified models
-            ada_target (float): Target discriminator accuracy (increased to 0.7)
-            ada_update (float): ADA update step size
-        """onditioned on binary cell membrane segmentation masks using PyTorch Lightning
+This script trains a conditional GAN to generate fluorescent cell images
+conditioned on binary cell membrane segmentation masks using PyTorch Lightning
 with Adaptive Discriminator Augmentation (ADA) for stable training.
 """
 
@@ -116,7 +100,7 @@ class AdaptiveDiscriminatorAugmentation:
     Adaptive Discriminator Augmentation (ADA) for stabilizing GAN training
     Based on CellSynthesis implementation
     """
-    def __init__(self, ada_target=0.6, ada_update=0.05, ada_update_period=4):
+    def __init__(self, ada_target=0.7, ada_update=0.05, ada_update_period=4):
         self.ada_target = ada_target
         self.ada_update = ada_update
         self.ada_update_period = ada_update_period
@@ -210,25 +194,14 @@ class IdentityLoss(nn.Module):
 class ConditionalGANTrainer:
     """
     Conditional GAN Trainer class using CellSynthesis-inspired training approach
+    with structural loss for mask conditioning
     """
     
     def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
-                 lr_g=0.0001, lr_d=0.0004, device=None, use_simple_models=False,
-                 ada_target=0.6, ada_update=0.05):
+                 lr_g=0.0002, lr_d=0.0001, device=None, use_simple_models=False,
+                 ada_target=0.7, ada_update=0.05):
         """
-        Initialize the conditional GAN trainer
-        
-        Args:
-            fluorescent_dir (str): Directory containing fluorescent TIF images
-            mask_dir (str): Directory containing binary mask TIF images
-            latent_dim (int): Dimension of noise vector
-            image_size (int): Size of generated images (assumed square)
-            lr_g (float): Generator learning rate
-            lr_d (float): Discriminator learning rate (higher for better performance)
-            device (str): Device to use for training
-            use_simple_models (bool): Whether to use simplified models
-            ada_target (float): Target discriminator accuracy for ADA
-            ada_update (float): ADA update step size
+        Initialize the conditional GAN trainer with structural loss
         """
         self.fluorescent_dir = fluorescent_dir
         self.mask_dir = mask_dir
@@ -286,7 +259,7 @@ class ConditionalGANTrainer:
         self.identity_loss = IdentityLoss()
         self.structural_loss = StructuralLoss()  # NEW: Structural loss for conditioning
         
-        # Optimizers - CellSynthesis style
+        # Optimizers - CellSynthesis style with rebalanced LRs
         self.optimizer_G = torch.optim.Adam(
             self.generator.parameters(), 
             lr=lr_g, 
@@ -298,7 +271,7 @@ class ConditionalGANTrainer:
             betas=(0.0, 0.99)
         )
         
-        # Initialize ADA
+        # Initialize ADA with higher target
         self.ada = AdaptiveDiscriminatorAugmentation(
             ada_target=ada_target,
             ada_update=ada_update,
@@ -616,7 +589,7 @@ class ConditionalGANTrainer:
 
 def main():
     """Main training function for unpaired conditional generation"""
-    parser = argparse.ArgumentParser(description='Train Conditional GAN with ADA for Mask-to-Fluorescent Generation')
+    parser = argparse.ArgumentParser(description='Train Conditional GAN with ADA and Structural Loss')
     parser.add_argument('--fluorescent_dir', type=str, required=True,
                       help='Directory containing real fluorescent images (for discriminator)')
     parser.add_argument('--mask_dir', type=str, required=True,
