@@ -10,6 +10,8 @@ with Adaptive Discriminator Augmentation (ADA) for stable training.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.data
+import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
 import tifffile
@@ -27,6 +29,70 @@ from conditional_generator import ConditionalGenerator, SimpleConditionalGenerat
 from conditional_discriminator import ConditionalDiscriminator, SimpleConditionalDiscriminator
 from conditional_dataloader import ConditionalImageDataset, SingleDirectoryConditionalDataset
 from unpaired_conditional_dataloader import UnpairedConditionalImageDataset
+
+
+class MaskOnlyDataset(torch.utils.data.Dataset):
+    """
+    Dataset that loads only mask images for conditional generation
+    """
+    def __init__(self, mask_dir, image_size=256):
+        self.mask_dir = mask_dir
+        self.image_size = image_size
+        
+        # Find all TIF files in mask directory
+        import glob
+        self.mask_paths = []
+        for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF']:
+            self.mask_paths.extend(glob.glob(os.path.join(mask_dir, ext)))
+        
+        if len(self.mask_paths) == 0:
+            raise ValueError(f"No TIF files found in {mask_dir}")
+        
+        # Basic transforms
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])  # Normalize to [-1, 1]
+        ])
+        
+        print(f"Found {len(self.mask_paths)} mask files")
+    
+    def __len__(self):
+        return len(self.mask_paths)
+    
+    def __getitem__(self, idx):
+        # Load mask image
+        mask_path = self.mask_paths[idx]
+        
+        try:
+            # Try loading with tifffile first
+            mask = tifffile.imread(mask_path)
+            
+            # Convert to PIL Image for transforms
+            if mask.dtype != np.uint8:
+                # Normalize to 0-255 range
+                mask = ((mask - mask.min()) / (mask.max() - mask.min()) * 255).astype(np.uint8)
+            
+            mask = Image.fromarray(mask).convert('L')  # Convert to grayscale
+            
+        except Exception as e:
+            print(f"Error loading {mask_path}: {e}")
+            # Return a dummy image
+            mask = Image.new('L', (self.image_size, self.image_size), 0)
+        
+        # Apply transforms
+        mask = self.transform(mask)
+        
+        return mask
+    
+    def get_dataset_info(self):
+        """Get information about the dataset"""
+        return {
+            'num_masks': len(self.mask_paths),
+            'mask_directory': self.mask_dir,
+            'target_size': (self.image_size, self.image_size),
+            'sample_paths': self.mask_paths[:5]
+        }
 
 
 class AdaptiveDiscriminatorAugmentation:
@@ -125,14 +191,21 @@ class ConditionalGANTrainer:
         
         print(f"Using device: {self.device}")
         
-        # Initialize dataset
+        # Initialize dataset for unpaired conditional generation
+        # Masks as conditions, real fluorescent images for discriminator
         try:
-            self.dataset = ConditionalImageDataset(fluorescent_dir, mask_dir, image_size)
-        except ValueError as e:
-            print(f"Error with separate directories: {e}")
-            print("Trying single directory approach...")
-            # Fallback to single directory if separate dirs don't work
-            self.dataset = SingleDirectoryConditionalDataset(fluorescent_dir, image_size=image_size)
+            # Use UnpairedConditionalImageDataset with correct directories
+            self.dataset = UnpairedConditionalImageDataset(
+                fluorescent_dir=fluorescent_dir,  # Real fluorescent images
+                mask_dir=mask_dir,                # Distance masks as conditions
+                image_size=image_size
+            )
+            print("Using unpaired conditional dataset (masks as conditions, real fluorescent for discrimination)")
+        except Exception as e:
+            print(f"Error with unpaired dataset: {e}")
+            print("Trying mask-only approach...")
+            # Fallback to mask-only if unpaired doesn't work
+            self.dataset = MaskOnlyDataset(mask_dir, image_size)
         
         # Print dataset info
         dataset_info = self.dataset.get_dataset_info()
@@ -206,54 +279,53 @@ class ConditionalGANTrainer:
     
     def training_step(self, batch, optimizer_idx):
         """
-        Training step inspired by CellSynthesis PyTorch Lightning approach
+        Training step for unpaired conditional generation
+        Generate fluorescent images from masks, discriminate against real fluorescent
         
         Args:
-            batch: Batch containing fluorescent images and masks
+            batch: Batch containing (real_fluorescent, masks) from unpaired dataset
             optimizer_idx: 0 for generator, 1 for discriminator
         """
-        fluorescent_imgs, masks = batch
-        batch_size = fluorescent_imgs.size(0)
+        real_fluorescent, masks = batch  # Unpaired real fluorescent and masks
+        batch_size = masks.size(0)
         
         # Generate random noise
         noise = torch.randn(batch_size, self.latent_dim, device=self.device)
         
-        # Generate fake images
-        fake_imgs = self.generator(noise, masks)
+        # Generate fake fluorescent images from masks
+        fake_fluorescent = self.generator(noise, masks)
         
         if optimizer_idx == 0:
             # Generator training step
-            return self._generator_step(fake_imgs, masks, fluorescent_imgs)
+            return self._generator_step(fake_fluorescent, masks)
         else:
             # Discriminator training step
-            return self._discriminator_step(fake_imgs.detach(), fluorescent_imgs, masks)
+            return self._discriminator_step(fake_fluorescent.detach(), real_fluorescent, masks)
     
-    def _generator_step(self, fake_imgs, masks, real_imgs):
-        """Generator training step"""
+    def _generator_step(self, fake_fluorescent, masks):
+        """Generator training step for unpaired conditional generation"""
         # Adversarial loss - fool the discriminator
-        fake_pred = self.discriminator(fake_imgs, masks)
+        fake_pred = self.discriminator(fake_fluorescent, masks)
         g_adv_loss = self.adversarial_loss(fake_pred, target_is_real=True)
         
-        # Identity loss - match real images
-        g_identity_loss = self.identity_loss(fake_imgs, real_imgs)
-        
-        # Total generator loss (weighted like CellSynthesis)
-        g_loss = g_adv_loss + 10.0 * g_identity_loss  # L1 weight = 10
+        # For unpaired training, we only have adversarial loss
+        # No identity loss since fluorescent images are unpaired with masks
+        g_loss = g_adv_loss
         
         return {
             'loss': g_loss,
             'g_adv_loss': g_adv_loss.item(),
-            'g_identity_loss': g_identity_loss.item()
+            'g_identity_loss': 0.0  # No identity loss in unpaired setting
         }
     
-    def _discriminator_step(self, fake_imgs, real_imgs, masks):
-        """Discriminator training step"""
-        # Real images
-        real_pred = self.discriminator(real_imgs, masks)
+    def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
+        """Discriminator training step for unpaired conditional generation"""
+        # Real fluorescent images (unpaired with masks, but we condition anyway)
+        real_pred = self.discriminator(real_fluorescent, masks)
         d_real_loss = self.adversarial_loss(real_pred, target_is_real=True)
         
-        # Fake images
-        fake_pred = self.discriminator(fake_imgs, masks)
+        # Fake fluorescent images (generated from masks)
+        fake_pred = self.discriminator(fake_fluorescent, masks)
         d_fake_loss = self.adversarial_loss(fake_pred, target_is_real=False)
         
         # Total discriminator loss
@@ -280,8 +352,9 @@ class ConditionalGANTrainer:
         num_batches = len(dataloader)
         
         for batch_idx, batch in enumerate(dataloader):
-            # Move batch to device
-            batch = [x.to(self.device) for x in batch]
+            # Move batch to device (real_fluorescent, masks from unpaired dataset)
+            real_fluorescent, masks = [x.to(self.device) for x in batch]
+            batch = (real_fluorescent, masks)
             
             # Train discriminator
             self.optimizer_D.zero_grad()
@@ -370,23 +443,23 @@ class ConditionalGANTrainer:
         self.save_final_results(output_dir)
     
     def save_samples(self, output_dir, epoch):
-        """Save generated samples"""
+        """Save generated fluorescent samples from masks"""
         self.generator.eval()
         
         with torch.no_grad():
-            # Get a batch from dataset
+            # Get a batch of (real_fluorescent, masks) from dataset
             sample_batch = next(iter(DataLoader(self.dataset, batch_size=8, shuffle=True)))
-            fluorescent_imgs, masks = [x.to(self.device) for x in sample_batch]
+            real_fluorescent, masks = [x.to(self.device) for x in sample_batch]
             
-            # Generate samples
+            # Generate fluorescent images from masks
             noise = torch.randn(masks.size(0), self.latent_dim, device=self.device)
-            fake_imgs = self.generator(noise, masks)
+            fake_fluorescent = self.generator(noise, masks)
             
-            # Save comparison
+            # Save comparison: masks -> real_fluorescent -> generated_fluorescent
             comparison = torch.cat([
                 masks.cpu(),
-                fluorescent_imgs.cpu(),
-                fake_imgs.cpu()
+                real_fluorescent.cpu(),
+                fake_fluorescent.cpu()
             ], dim=0)
             
             save_path = os.path.join(output_dir, f'samples_epoch_{epoch+1}.png')
@@ -478,12 +551,12 @@ class ConditionalGANTrainer:
 
 
 def main():
-    """Main training function"""
-    parser = argparse.ArgumentParser(description='Train Conditional GAN with ADA')
+    """Main training function for unpaired conditional generation"""
+    parser = argparse.ArgumentParser(description='Train Conditional GAN with ADA for Mask-to-Fluorescent Generation')
     parser.add_argument('--fluorescent_dir', type=str, required=True,
-                      help='Directory containing fluorescent images')
+                      help='Directory containing real fluorescent images (for discriminator)')
     parser.add_argument('--mask_dir', type=str, required=True,
-                      help='Directory containing mask images')
+                      help='Directory containing mask images (conditions)')
     parser.add_argument('--output_dir', type=str, default='./outputs_ada',
                       help='Output directory for results')
     parser.add_argument('--epochs', type=int, default=100,
@@ -509,10 +582,10 @@ def main():
     
     args = parser.parse_args()
     
-    # Create trainer
+    # Create trainer for unpaired conditional generation
     trainer = ConditionalGANTrainer(
-        fluorescent_dir=args.fluorescent_dir,
-        mask_dir=args.mask_dir,
+        fluorescent_dir=args.fluorescent_dir,  # Real fluorescent images
+        mask_dir=args.mask_dir,                # Distance masks as conditions
         latent_dim=args.latent_dim,
         image_size=args.image_size,
         lr_g=args.lr_g,
