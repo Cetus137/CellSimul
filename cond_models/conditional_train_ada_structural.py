@@ -144,46 +144,99 @@ class StructuralLoss(nn.Module):
         
     def forward(self, generated_fluorescent, masks):
         """
-        Compute structural loss between generated fluorescent images and masks.
-        Uses a simpler, more direct approach focused on the core relationship:
-        fluorescent intensity should be higher where mask distance values are higher.
+        Compute structural loss using multiple complementary approaches.
         
         Args:
             generated_fluorescent: Generated fluorescent images [B, 1, H, W]
             masks: Distance mask conditions [B, 1, H, W]
         """
-        # Normalize both to [0, 1] range for consistent comparison
+        batch_size = generated_fluorescent.size(0)
+        
+        # Debug: Check actual value ranges
+        if hasattr(self, '_debug_count'):
+            self._debug_count += 1
+        else:
+            self._debug_count = 1
+            
+        if self._debug_count <= 3:  # Only print first few times
+            print(f"DEBUG Structural Loss:")
+            print(f"  Mask range: [{masks.min().item():.4f}, {masks.max().item():.4f}]")
+            print(f"  Fluorescent range: [{generated_fluorescent.min().item():.4f}, {generated_fluorescent.max().item():.4f}]")
+            print(f"  Mask std: {masks.std().item():.4f}")
+            print(f"  Fluorescent std: {generated_fluorescent.std().item():.4f}")
+        
+        # Approach 1: Simple monotonic relationship
+        # Convert from [-1, 1] to [0, 1] range for both
         masks_norm = (masks + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
         fluor_norm = (generated_fluorescent + 1.0) / 2.0
         
-        # Primary Loss: Direct correlation - high mask values should produce high fluorescent values
-        # Use a more direct approach: MSE between scaled mask and fluorescent
-        # Scale mask to encourage stronger fluorescent response
-        target_fluorescent = masks_norm * 0.7 + 0.2  # Map [0,1] mask to [0.2, 0.9] target
-        direct_loss = F.mse_loss(fluor_norm, target_fluorescent)
+        # Check if masks have meaningful variation
+        mask_variation = masks_norm.std()
+        if mask_variation < 0.01:
+            # If masks have very little variation, this might be the problem
+            if self._debug_count <= 3:
+                print(f"  WARNING: Low mask variation: {mask_variation:.6f}")
         
-        # Secondary Loss: Consistency loss - similar mask regions should have similar fluorescent values
-        # Create neighborhood comparison to encourage spatial consistency
-        # Use average pooling to get local neighborhood values
-        avg_pool = F.avg_pool2d(fluor_norm, kernel_size=5, stride=1, padding=2)
-        avg_mask = F.avg_pool2d(masks_norm, kernel_size=5, stride=1, padding=2)
+        # Direct MSE with a simple linear relationship
+        # High mask values should produce high fluorescent values
+        simple_loss = F.mse_loss(fluor_norm, masks_norm)
         
-        # Penalize when local fluorescent average doesn't match local mask average
-        consistency_loss = F.mse_loss(avg_pool, avg_mask * 0.7 + 0.2)
+        # Approach 2: Rank correlation for relative ordering
+        fluor_flat = generated_fluorescent.view(batch_size, -1)
+        mask_flat = masks.view(batch_size, -1)
         
-        # Tertiary Loss: Edge preservation - maintain structure boundaries
-        # Simple gradient magnitude comparison
-        fluor_grad_x = torch.abs(fluor_norm[:, :, :, 1:] - fluor_norm[:, :, :, :-1])
-        fluor_grad_y = torch.abs(fluor_norm[:, :, 1:, :] - fluor_norm[:, :, :-1, :])
-        mask_grad_x = torch.abs(masks_norm[:, :, :, 1:] - masks_norm[:, :, :, :-1])
-        mask_grad_y = torch.abs(masks_norm[:, :, 1:, :] - masks_norm[:, :, :-1, :])
+        rank_loss = 0.0
+        for b in range(batch_size):
+            # Sample a subset for efficiency (every 16th pixel)
+            indices = torch.arange(0, fluor_flat.size(1), 16, device=fluor_flat.device)
+            fluor_sample = fluor_flat[b][indices]
+            mask_sample = mask_flat[b][indices]
+            
+            # Sort by mask values
+            sorted_indices = torch.argsort(mask_sample)
+            fluor_sorted = fluor_sample[sorted_indices]
+            
+            # Check if fluorescent values are also sorted
+            # Use differences between consecutive elements
+            fluor_diffs = fluor_sorted[1:] - fluor_sorted[:-1]
+            # We want most differences to be positive (ascending)
+            rank_loss += torch.relu(-fluor_diffs).mean()  # Penalize descending
         
-        edge_loss_x = F.mse_loss(fluor_grad_x, mask_grad_x)
-        edge_loss_y = F.mse_loss(fluor_grad_y, mask_grad_y)
-        edge_loss = (edge_loss_x + edge_loss_y) / 2.0
+        rank_loss = rank_loss / batch_size
         
-        # Combined loss with emphasis on direct correlation
-        total_loss = 2.0 * direct_loss + 0.5 * consistency_loss + 0.3 * edge_loss
+        # Approach 3: Extrema matching
+        # High mask regions should have high fluorescent, low mask should have low fluorescent
+        # Find top 10% and bottom 10% of mask values
+        mask_flat_norm = masks_norm.view(batch_size, -1)
+        fluor_flat_norm = fluor_norm.view(batch_size, -1)
+        
+        extrema_loss = 0.0
+        for b in range(batch_size):
+            n_pixels = mask_flat_norm.size(1)
+            k = max(1, n_pixels // 10)  # Top/bottom 10%
+            
+            # Top k mask locations should have high fluorescent
+            _, top_mask_indices = torch.topk(mask_flat_norm[b], k)
+            top_fluor_values = fluor_flat_norm[b][top_mask_indices]
+            top_loss = F.mse_loss(top_fluor_values, torch.ones_like(top_fluor_values) * 0.8)
+            
+            # Bottom k mask locations should have low fluorescent  
+            _, bottom_mask_indices = torch.topk(mask_flat_norm[b], k, largest=False)
+            bottom_fluor_values = fluor_flat_norm[b][bottom_mask_indices]
+            bottom_loss = F.mse_loss(bottom_fluor_values, torch.ones_like(bottom_fluor_values) * 0.2)
+            
+            extrema_loss += (top_loss + bottom_loss)
+        
+        extrema_loss = extrema_loss / batch_size
+        
+        # Combine all approaches
+        total_loss = simple_loss + rank_loss + extrema_loss
+        
+        if self._debug_count <= 3:
+            print(f"  Simple loss: {simple_loss.item():.4f}")
+            print(f"  Rank loss: {rank_loss.item():.4f}")
+            print(f"  Extrema loss: {extrema_loss.item():.4f}")
+            print(f"  Total loss: {total_loss.item():.4f}")
         
         return total_loss
 
@@ -401,9 +454,9 @@ class ConditionalGANTrainer:
         # Structural loss - enforce mask-fluorescent correspondence  
         g_structural_loss = self.structural_loss(fake_fluorescent, masks)
         
-        # CellSynthesis-style balanced loss with strong structural guidance
-        # Increase structural loss weight to ensure proper conditioning
-        g_loss = (g_adv_loss + g_identity_loss) / 2.0 + 1.0 * g_structural_loss
+        # Make structural loss dominant to force proper conditioning
+        # Reduce competing losses to ensure structural guidance takes priority
+        g_loss = 0.3 * g_adv_loss + 0.1 * g_identity_loss + 2.0 * g_structural_loss
         
         return {
             'loss': g_loss,
