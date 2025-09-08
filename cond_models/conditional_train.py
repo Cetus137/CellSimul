@@ -742,11 +742,30 @@ def main():
                     # Train Discriminator (with frequency control)
                     # ============================================
                     
+                    # Calculate current d_loss for frequency control decision (without training)
+                    with torch.no_grad():
+                        # Quick discriminator evaluation for frequency control
+                        d_output_real_check = discriminator(real_fluorescent, condition_masks)
+                        d_output_fake_check = discriminator(generated_fluorescent.detach(), condition_masks)
+                        
+                        # Flatten if needed
+                        if d_output_real_check.dim() > 2:
+                            d_output_real_check = d_output_real_check.view(batch_size, -1).mean(dim=1)
+                        if d_output_fake_check.dim() > 2:
+                            d_output_fake_check = d_output_fake_check.view(batch_size, -1).mean(dim=1)
+                        
+                        # Calculate current d_loss for condition checking
+                        real_labels_check = torch.full((batch_size,), 0.9, device=device)
+                        fake_labels_check = torch.full((batch_size,), 0.1, device=device)
+                        d_real_loss_check = adversarial_criterion(torch.clamp(d_output_real_check, 1e-7, 1-1e-7), real_labels_check)
+                        d_fake_loss_check = adversarial_criterion(torch.clamp(d_output_fake_check, 1e-7, 1-1e-7), fake_labels_check)
+                        current_d_loss = (d_real_loss_check + d_fake_loss_check) / 2
+                    
                     # Only train discriminator if it's not too strong
-                    # If D_loss is consistently low, skip discriminator training
+                    # Use current_d_loss instead of stale d_loss from previous batch
                     train_discriminator = True
                     if batch_idx > 10:  # After some initial training
-                        if d_loss.item() < 0.6:  # More aggressive threshold: increased from 0.35 to 0.6
+                        if current_d_loss.item() < 0.6:  # More aggressive threshold: increased from 0.35 to 0.6
                             train_discriminator = (batch_idx % 8 == 0)  # Train D only every 8th iteration (was 3rd)
                     
                     if train_discriminator:
@@ -803,7 +822,8 @@ def main():
                     num_batches += 1
                     
                     if batch_idx % 10 == 0:
-                        d_loss_str = f"{d_loss.item():.4f}" if train_discriminator else "SKIP"
+                        # Show current d_loss even when training is skipped
+                        d_loss_str = f"{d_loss.item():.4f}" if train_discriminator else f"{current_d_loss.item():.4f}"
                         train_status = " [D_SKIP]" if not train_discriminator else ""
                         print(f"  Epoch [{epoch+1}/{args.num_epochs}] Batch [{batch_idx}/{len(dataloader)}] "
                               f"D_loss: {d_loss_str}, G_loss: {g_loss.item():.4f}, "
