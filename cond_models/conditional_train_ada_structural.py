@@ -697,24 +697,18 @@ class ConditionalGANTrainer:
             
             print(f"Generated fluorescent range: [{fake_fluorescent.min():.3f}, {fake_fluorescent.max():.3f}]")
             
-            # Create overlay visualization (mask in red, generated in green)
-            # Normalize both to [0, 1] for visualization
-            masks_vis = (masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
-            fake_vis = (fake_fluorescent + 1.0) / 2.0
+            # Create simple difference visualization (grayscale)
+            # Show absolute difference between normalized mask and generated fluorescent
+            masks_norm = (masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+            fake_norm = (fake_fluorescent + 1.0) / 2.0
+            difference = torch.abs(masks_norm - fake_norm)
             
-            # Create RGB overlay: Red channel = mask, Green channel = generated fluorescent
-            batch_size = masks.size(0)
-            overlay = torch.zeros(batch_size, 3, masks.size(2), masks.size(3))
-            overlay[:, 0, :, :] = masks_vis.squeeze(1)  # Red channel = masks
-            overlay[:, 1, :, :] = fake_vis.squeeze(1)   # Green channel = generated
-            overlay[:, 2, :, :] = 0.0                   # Blue channel = empty
-            
-            # Save comparison: masks -> real_fluorescent -> generated_fluorescent -> overlay
+            # Save comparison: masks -> real_fluorescent -> generated_fluorescent -> difference
             comparison = torch.cat([
                 masks.cpu(),
                 real_fluorescent.cpu(),
                 fake_fluorescent.cpu(),
-                overlay.cpu()
+                difference.cpu()
             ], dim=0)
             
             save_path = os.path.join(output_dir, f'samples_epoch_{epoch+1}.png')
@@ -723,7 +717,7 @@ class ConditionalGANTrainer:
             print(f"  Row 1: Distance masks (white = far from membrane)")
             print(f"  Row 2: Real fluorescent images")
             print(f"  Row 3: Generated fluorescent images")
-            print(f"  Row 4: Overlay (Red = mask, Green = generated, Yellow = overlap)")
+            print(f"  Row 4: Difference map (dark = good match, bright = poor match)")
     
     def save_models(self, output_dir, epoch):
         """Save model checkpoints"""
