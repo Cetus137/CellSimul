@@ -272,7 +272,7 @@ class ConditionalGANTrainer:
     
     def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
                  lr_g=0.0002, lr_d=0.0002, device=None, use_simple_models=False,
-                 ada_target=0.3, ada_update=0.05):
+                 ada_target=0.1, ada_update=0.05):
         """
         Initialize the conditional GAN trainer with structural loss
         """
@@ -819,8 +819,8 @@ def main():
                       help='Latent dimension')
     parser.add_argument('--image_size', type=int, default=256,
                       help='Image size')
-    parser.add_argument('--ada_target', type=float, default=0.3,
-                      help='ADA target accuracy (reduced for better conditioning)')
+    parser.add_argument('--ada_target', type=float, default=0.1,
+                      help='ADA target accuracy (very low for maximum conditioning learning)')
     parser.add_argument('--ada_update', type=float, default=0.05,
                       help='ADA update step size (CellSynthesis default)')
     parser.add_argument('--use_simple_models', action='store_true',
