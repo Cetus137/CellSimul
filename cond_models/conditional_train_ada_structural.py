@@ -207,7 +207,7 @@ class ConditionalGANTrainer:
     """
     
     def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
-                 lr_g=0.001, lr_d=0.001, device=None, use_simple_models=False,
+                 lr_g=0.0002, lr_d=0.0002, device=None, use_simple_models=False,
                  ada_target=0.6, ada_update=0.05):
         """
         Initialize the conditional GAN trainer with structural loss
@@ -383,9 +383,9 @@ class ConditionalGANTrainer:
         # Structural loss - enforce mask-fluorescent correspondence  
         g_structural_loss = self.structural_loss(fake_fluorescent, masks)
         
-        # CellSynthesis-style combined loss: (adv_loss + identity_loss) / 2 + structural
-        # Balanced combination similar to CellSynthesis approach
-        g_loss = (g_adv_loss + g_identity_loss) / 2.0 + g_structural_loss
+        # CellSynthesis-style balanced loss with proper weighting
+        # Reduce structural loss weight to prevent overwhelming adversarial training
+        g_loss = (g_adv_loss + g_identity_loss) / 2.0 + 0.1 * g_structural_loss
         
         return {
             'loss': g_loss,
@@ -416,12 +416,16 @@ class ConditionalGANTrainer:
             # 50% chance: use actual masks for real images
             real_masks = masks
             
+        # CellSynthesis-style discriminator training with label smoothing for stability
+        # Real images: use label smoothing (0.9 instead of 1.0) to improve stability
         real_pred = self.discriminator(real_fluorescent, real_masks)
-        d_real_loss = self.adversarial_loss(real_pred, target_is_real=True)
+        real_labels = torch.ones_like(real_pred) * 0.9  # Label smoothing
+        d_real_loss = F.binary_cross_entropy_with_logits(real_pred, real_labels)
         
-        # Fake fluorescent images - always properly conditioned on the masks they were generated from
+        # Fake images: use hard labels (0.0) to maintain discrimination
         fake_pred = self.discriminator(fake_fluorescent, masks)
-        d_fake_loss = self.adversarial_loss(fake_pred, target_is_real=False)
+        fake_labels = torch.zeros_like(fake_pred)
+        d_fake_loss = F.binary_cross_entropy_with_logits(fake_pred, fake_labels)
         
         # CellSynthesis-style discriminator loss: average of real and fake losses
         d_loss = (d_real_loss + d_fake_loss) / 2.0
@@ -705,10 +709,10 @@ def main():
                       help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=16,
                       help='Batch size')
-    parser.add_argument('--lr_g', type=float, default=0.001,
-                      help='Generator learning rate (CellSynthesis default)')
-    parser.add_argument('--lr_d', type=float, default=0.001,
-                      help='Discriminator learning rate (CellSynthesis default)')
+    parser.add_argument('--lr_g', type=float, default=0.0002,
+                      help='Generator learning rate (conservative for stability)')
+    parser.add_argument('--lr_d', type=float, default=0.0002,
+                      help='Discriminator learning rate (conservative for stability)')
     parser.add_argument('--latent_dim', type=int, default=100,
                       help='Latent dimension')
     parser.add_argument('--image_size', type=int, default=256,
