@@ -697,27 +697,30 @@ class ConditionalGANTrainer:
             
             print(f"Generated fluorescent range: [{fake_fluorescent.min():.3f}, {fake_fluorescent.max():.3f}]")
             
-            # Create simple difference visualization (grayscale)
-            # Show absolute difference between normalized mask and generated fluorescent
+            # Create overlay visualization (normalized masks + generated images)
+            # Normalize both to [0,1] for proper overlay
             masks_norm = (masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
             fake_norm = (fake_fluorescent + 1.0) / 2.0
-            difference = torch.abs(masks_norm - fake_norm)
             
-            # Save comparison: masks -> real_fluorescent -> generated_fluorescent -> difference
+            # Create overlay by averaging normalized mask and generated fluorescent
+            # This shows where they align (bright) vs where they differ (darker)
+            overlay = (masks_norm + fake_norm) / 2.0
+            
+            # Save comparison: real_fluorescent -> masks -> generated -> overlay
             comparison = torch.cat([
-                masks.cpu(),
                 real_fluorescent.cpu(),
+                masks.cpu(),
                 fake_fluorescent.cpu(),
-                difference.cpu()
+                overlay.cpu()
             ], dim=0)
             
             save_path = os.path.join(output_dir, f'samples_epoch_{epoch+1}.png')
             save_image(comparison, save_path, nrow=masks.size(0), normalize=True)
             print(f"Saved samples to {save_path}")
-            print(f"  Row 1: Distance masks (white = far from membrane)")
-            print(f"  Row 2: Real fluorescent images")
-            print(f"  Row 3: Generated fluorescent images")
-            print(f"  Row 4: Difference map (dark = good match, bright = poor match)")
+            print(f"  Row 1: Real fluorescent images (targets)")
+            print(f"  Row 2: Distance masks (conditions - white = far from membrane)")
+            print(f"  Row 3: Generated fluorescent images (from masks)")
+            print(f"  Row 4: Overlay (normalized masks + generated - bright = good alignment)")
     
     def save_models(self, output_dir, epoch):
         """Save model checkpoints"""
@@ -853,7 +856,7 @@ def main():
     trainer.train(
         num_epochs=args.epochs,
         batch_size=args.batch_size,
-        save_interval=10,
+        save_interval=1,  # Save every epoch to see progress
         output_dir=args.output_dir
     )
 
