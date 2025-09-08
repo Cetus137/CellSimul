@@ -198,8 +198,8 @@ class ConditionalGANTrainer:
     """
     
     def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
-                 lr_g=0.0002, lr_d=0.0001, device=None, use_simple_models=False,
-                 ada_target=0.7, ada_update=0.05):
+                 lr_g=0.0001, lr_d=0.0002, device=None, use_simple_models=False,
+                 ada_target=0.5, ada_update=0.01):
         """
         Initialize the conditional GAN trainer with structural loss
         """
@@ -284,12 +284,13 @@ class ConditionalGANTrainer:
         self.d_losses = []
         self.ada_probs = []
         
-        # Update default learning rates to fix ADA=1.0 issue
-        # Increase generator LR, decrease discriminator LR
+        # Aggressive rebalancing to prevent discriminator collapse
+        # Reduce generator LR, increase discriminator LR significantly
         print(f"Initialized ConditionalGANTrainer:")
-        print(f"  Generator LR: {lr_g} (increased)")
-        print(f"  Discriminator LR: {lr_d} (decreased to fix ADA=1.0)")
-        print(f"  ADA Target: {ada_target} (increased to 0.7)")
+        print(f"  Generator LR: {lr_g} (reduced to prevent overpowering discriminator)")
+        print(f"  Discriminator LR: {lr_d} (increased for stronger discriminator)")
+        print(f"  ADA Target: {ada_target} (reduced to 0.5 - easier target)")
+        print(f"  ADA Update: {ada_update} (reduced to 0.01 for very gentle adjustments)")
         print(f"  Device: {self.device}")
     
     def _init_weights(self):
@@ -355,26 +356,63 @@ class ConditionalGANTrainer:
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
         """Discriminator training step for unpaired conditional generation"""
-        # Real fluorescent images (unpaired with masks, but we condition anyway)
-        real_pred = self.discriminator(real_fluorescent, masks)
+        
+        # FIXED: For unpaired training, discriminator should judge fluorescent images 
+        # independently of masks, not condition on random mask pairings
+        
+        # Real fluorescent images - discriminate without conditioning on random masks
+        # Since data is unpaired, we don't condition real images on masks
+        real_pred = self.discriminator(real_fluorescent, torch.zeros_like(masks))  # Use zero masks for real
         d_real_loss = self.adversarial_loss(real_pred, target_is_real=True)
         
-        # Fake fluorescent images (generated from masks)
+        # Fake fluorescent images - properly conditioned on the masks they were generated from
         fake_pred = self.discriminator(fake_fluorescent, masks)
         d_fake_loss = self.adversarial_loss(fake_pred, target_is_real=False)
         
-        # Total discriminator loss
-        d_loss = (d_real_loss + d_fake_loss) / 2
+        # Add gradient penalty for stability (prevents discriminator collapse)
+        gradient_penalty = self._compute_gradient_penalty(real_fluorescent, fake_fluorescent, masks)
         
-        # Update ADA based on real predictions
+        # Total discriminator loss with regularization
+        d_loss = (d_real_loss + d_fake_loss) / 2 + 0.1 * gradient_penalty
+        
+        # Update ADA based on real predictions (without mask conditioning)
         ada_prob = self.ada.update(real_pred)
         
         return {
             'loss': d_loss,
             'd_real_loss': d_real_loss.item(),
             'd_fake_loss': d_fake_loss.item(),
+            'gradient_penalty': gradient_penalty.item(),
             'ada_prob': ada_prob
         }
+    
+    def _compute_gradient_penalty(self, real_images, fake_images, masks):
+        """Compute gradient penalty for WGAN-GP style regularization"""
+        batch_size = real_images.size(0)
+        alpha = torch.rand(batch_size, 1, 1, 1, device=self.device)
+        
+        # Interpolate between real and fake images
+        interpolated = alpha * real_images + (1 - alpha) * fake_images
+        interpolated.requires_grad_(True)
+        
+        # Get discriminator output for interpolated images
+        # Use zero masks for interpolated samples to avoid mask conditioning issues
+        d_interpolated = self.discriminator(interpolated, torch.zeros_like(masks))
+        
+        # Compute gradients
+        gradients = torch.autograd.grad(
+            outputs=d_interpolated.sum(),
+            inputs=interpolated,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+        
+        # Calculate gradient penalty
+        gradients = gradients.view(batch_size, -1)
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        
+        return gradient_penalty
     
     def train_epoch(self, dataloader):
         """Train for one epoch using alternating optimization"""

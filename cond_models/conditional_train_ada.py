@@ -5,7 +5,7 @@ Inspired by CellSynthesis: https://github.com/stegmaierj/CellSynthesis
 This script trains a conditional GAN to generate fluores    def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
                  lr_g=0.0002, lr_d=0.0001, device=None, use_simple_models=False,
                  ada_target=0.7, ada_update=0.05):
-        """
+        
         Initialize the conditional GAN trainer
         
         Args:
@@ -19,12 +19,10 @@ This script trains a conditional GAN to generate fluores    def __init__(self, f
             use_simple_models (bool): Whether to use simplified models
             ada_target (float): Target discriminator accuracy (increased to 0.7)
             ada_update (float): ADA update step size
-        """onditioned on binary cell membrane segmentation masks using PyTorch Lightning
-with Adaptive Discriminator Augmentation (ADA) for stable training.
 """
 
 import torch
-import torch.nn as nn
+import torch.nn as nn   
 import torch.nn.functional as F
 import torch.utils.data
 import torchvision.transforms as transforms
