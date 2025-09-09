@@ -1,10 +1,12 @@
 """
 Conditional GAN Training Script for Fluorescent Microscopy Images
-Inspired by CellSynthesis: https://github.com/stegmaierj/CellSynthesis
+Following Original CellSynthesis Approach: https://github.com/stegmaierj/CellSynthesis
 
 This script trains a conditional GAN to generate fluorescent cell images
 conditioned on binary cell membrane segmentation masks using PyTorch Lightning
 with Adaptive Discriminator Augmentation (ADA) for stable training.
+
+Uses simple CellSynthesis loss: adversarial_loss + identity_loss (no structural loss)
 """
 
 import torch
@@ -327,15 +329,15 @@ class ConditionalGANTrainer:
         # Initialize weights
         self._init_weights()
         
-        # Loss functions
+        # Loss functions - Following original CellSynthesis (adversarial + identity only)
         self.adversarial_loss = AdversarialLoss()
         self.identity_loss = IdentityLoss()
-        self.structural_loss = StructuralLoss()  # NEW: Structural loss for conditioning
+        # self.structural_loss = StructuralLoss()  # REMOVED: Not used in original CellSynthesis
         
-        # Optimizers - CellSynthesis RAdam with ultra-conservative learning rates
-        # Use the passed learning rates or ultra-conservative defaults
-        lr_g = self.lr_g if self.lr_g else 0.0001
-        lr_d = self.lr_d if self.lr_d else 0.0001
+        # Optimizers - CellSynthesis RAdam with increased learning rates for recovery
+        # Use the passed learning rates or recovery-friendly defaults
+        lr_g = self.lr_g if self.lr_g else 0.0002  # Increased from 0.0001
+        lr_d = self.lr_d if self.lr_d else 0.0002  # Increased from 0.0001
         
         try:
             # Try to import RAdam from CellSynthesis approach
@@ -468,33 +470,25 @@ class ConditionalGANTrainer:
         - Identity loss (when feeding real images through generator)
         - Structural loss (mask-fluorescent correspondence)
         """
-        # Adversarial loss - fool the discriminator
+        # UNPAIRED CONDITIONAL GAN APPROACH
+        # 1. Adversarial loss - fool the discriminator
         fake_pred = self.discriminator(fake_fluorescent, masks)
         g_adv_loss = self.adversarial_loss(fake_pred, target_is_real=True)
         
-        # Identity loss - CellSynthesis style: generator should preserve structure
-        # Generate from the same masks to test identity preservation
-        noise_identity = torch.randn_like(torch.randn(fake_fluorescent.size(0), self.latent_dim, device=self.device))
-        identity_generated = self.generator(noise_identity, masks)
-        g_identity_loss = self.identity_loss(identity_generated, fake_fluorescent.detach())
+        # 2. Self-consistency loss - same inputs should produce same outputs
+        # This ensures the generator is deterministic for given (noise, mask) pairs
+        noise_consistency = torch.randn(fake_fluorescent.size(0), self.latent_dim, device=self.device)
+        consistent_generated1 = self.generator(noise_consistency, masks)
+        consistent_generated2 = self.generator(noise_consistency, masks)  # Same inputs
+        g_consistency_loss = self.identity_loss(consistent_generated1, consistent_generated2)
         
-        # Structural loss - enforce mask-fluorescent correspondence  
-        g_structural_loss = self.structural_loss(fake_fluorescent, masks)
-        
-        # Add explicit mask dependency penalty
-        # Penalize if generated image doesn't vary when mask changes
-        mask_dependency_loss = self._compute_mask_dependency_loss(fake_fluorescent, masks)
-        
-        # Balanced conditioning - reduced from extreme values for more stable training
-        # Still emphasizes structure but not overwhelming
-        g_loss = 0.2 * g_adv_loss + 0.05 * g_identity_loss + 2.0 * g_structural_loss + 0.8 * mask_dependency_loss
+        # Weighted combination: emphasize adversarial training for unpaired data
+        g_loss = g_adv_loss + 0.1 * g_consistency_loss  # Light consistency regularization
         
         return {
             'loss': g_loss,
             'g_adv_loss': g_adv_loss.item(),
-            'g_structural_loss': g_structural_loss.item(),
-            'g_identity_loss': g_identity_loss.item(),
-            'g_mask_dependency_loss': mask_dependency_loss.item()
+            'g_consistency_loss': g_consistency_loss.item()
         }
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
@@ -624,12 +618,18 @@ class ConditionalGANTrainer:
             self.optimizer_G.zero_grad()
             g_results = self.training_step(batch, optimizer_idx=0)
             g_results['loss'].backward()
+            
+            # Gradient clipping to prevent instability
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
             self.optimizer_G.step()
             
             # Train discriminator second (optimizer_idx=1)  
             self.optimizer_D.zero_grad()
             d_results = self.training_step(batch, optimizer_idx=1)
             d_results['loss'].backward()
+            
+            # Gradient clipping for discriminator too
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
             self.optimizer_D.step()
             
             # Accumulate losses
@@ -637,15 +637,13 @@ class ConditionalGANTrainer:
             epoch_d_loss += d_results['loss'].item()
             epoch_ada_prob += d_results['ada_prob']
             
-            # Print progress with CellSynthesis-style metrics
+            # Print progress with unpaired conditional GAN metrics
             if batch_idx % 50 == 0:
                 current_ada_target = self.ada.ada_target
                 print(f"Batch {batch_idx}/{num_batches}: "
                       f"G_loss: {g_results['loss'].item():.4f} "
                       f"(adv: {g_results['g_adv_loss']:.4f}, "
-                      f"id: {g_results['g_identity_loss']:.4f}, "
-                      f"struct: {g_results['g_structural_loss']:.4f}, "
-                      f"mask_dep: {g_results['g_mask_dependency_loss']:.4f}), "
+                      f"cons: {g_results['g_consistency_loss']:.4f}), "
                       f"D_loss: {d_results['loss'].item():.4f} "
                       f"(real: {d_results['d_real_loss']:.4f}, "
                       f"fake: {d_results['d_fake_loss']:.4f}), "
