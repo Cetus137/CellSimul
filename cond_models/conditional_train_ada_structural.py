@@ -764,6 +764,13 @@ class ConditionalGANTrainer:
     
     def display_samples(self, epoch):
         """Display generated samples in a matplotlib window"""
+        # Ensure matplotlib displays inline in Colab
+        try:
+            import matplotlib
+            matplotlib.use('inline')  # For Colab/Jupyter
+        except:
+            pass
+            
         self.generator.eval()
         
         with torch.no_grad():
@@ -819,7 +826,16 @@ class ConditionalGANTrainer:
                 axes[3, i].axis('off')
             
             plt.tight_layout()
+            
+            # Force display in Colab
+            try:
+                from IPython.display import display
+                display(fig)
+            except ImportError:
+                pass  # Not in Jupyter/Colab
+            
             plt.show()
+            plt.close(fig)  # Clean up memory
             print(f"Displayed samples for epoch {epoch+1}")
         
         self.generator.train()
