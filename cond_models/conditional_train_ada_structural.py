@@ -1,14 +1,15 @@
 """
-Conditional GAN Training Script for Fluorescent Microscopy Images
-Simplified CellSynthesis Approach for Unpaired Data: https://github.com/stegmaierj/CellSynthesis
+PURE CellSynthesis Conditional GAN Training
 
-This script trains a conditional GAN to generate fluorescent cell images
-conditioned on binary cell membrane segmentation masks using PyTorch Lightning
-with Adaptive Discriminator Augmentation (ADA) for stable training.
+This module implements a conditional GAN following the exact CellSynthesis methodology:
+- Generator: Takes noise + condition (distance mask) -> generates fluorescent image
+- Discriminator: Classifies real vs fake fluorescent images given masks
+- Loss: Pure adversarial loss only (like original CellSynthesis)
+- Training: Alternating generator/discriminator updates
+- Augmentation: ADA (Adaptive Discriminator Augmentation) for stability
 
-Uses simplified CellSynthesis-inspired loss for unpaired data:
-- Adversarial loss (primary, like CellSynthesis)
-- Light feature matching loss (unpaired alternative to identity loss)
+CellSynthesis approach simplified for fluorescent image generation from distance masks.
+No complex losses, no identity loss, no structural loss - just adversarial training.
 """
 
 import torch
@@ -331,22 +332,21 @@ class ConditionalGANTrainer:
         # Initialize weights
         self._init_weights()
         
-        # Loss functions - Following original CellSynthesis (adversarial + identity only)
+        # Loss functions - PURE CellSynthesis (adversarial loss only)
         self.adversarial_loss = AdversarialLoss()
-        self.identity_loss = IdentityLoss()
+        # self.identity_loss = IdentityLoss()  # REMOVED: Not used in pure CellSynthesis
         # self.structural_loss = StructuralLoss()  # REMOVED: Not used in original CellSynthesis
         
-        # Optimizers - CellSynthesis RAdam with increased learning rates for recovery
-        # Use the passed learning rates or recovery-friendly defaults
-        lr_g = self.lr_g if self.lr_g else 0.0002  # Increased from 0.0001
-        lr_d = self.lr_d if self.lr_d else 0.0002  # Increased from 0.0001
+        # Optimizers - Balanced learning rates like original CellSynthesis
+        lr_g = self.lr_g if self.lr_g else 0.0002
+        lr_d = self.lr_d if self.lr_d else 0.0002  # Balanced with generator
         
         try:
             # Try to import RAdam from CellSynthesis approach
             from torch.optim import RAdam
             self.optimizer_G = RAdam(self.generator.parameters(), lr=lr_g, weight_decay=1e-4)
             self.optimizer_D = RAdam(self.discriminator.parameters(), lr=lr_d, weight_decay=1e-4)
-            print(f"Using RAdam optimizer with ultra-conservative LR: G={lr_g}, D={lr_d}")
+            print(f"Using RAdam optimizer with balanced CellSynthesis LR: G={lr_g}, D={lr_d}")
         except ImportError:
             # Fallback to Adam with CellSynthesis-like settings
             self.optimizer_G = torch.optim.Adam(
@@ -361,7 +361,7 @@ class ConditionalGANTrainer:
                 betas=(0.5, 0.999),
                 weight_decay=1e-4
             )
-            print(f"Using Adam optimizer with ultra-conservative LR: G={lr_g}, D={lr_d}")
+            print(f"Using Adam optimizer with balanced CellSynthesis LR: G={lr_g}, D={lr_d}")
             
         # Store the actual LRs used
         self.actual_lr_g = lr_g
@@ -371,12 +371,11 @@ class ConditionalGANTrainer:
         self.ada_target = ada_target
         self.ada_update = ada_update
         
-        print(f"Initialized ConditionalGANTrainer with CellSynthesis-inspired approach:")
+        print(f"Initialized ConditionalGANTrainer with PURE CellSynthesis approach:")
         print(f"  Generator LR: {lr_g}")
         print(f"  Discriminator LR: {lr_d}")
+        print(f"  Loss: Adversarial only (like original CellSynthesis)")
         print(f"  ADA Target: {ada_target}")
-        print(f"  ADA Update: {ada_update}")
-        print(f"  ADA Update Period: 4 epochs (more stable)")
         print(f"  Device: {self.device}")
         
         self.ada = AdaptiveDiscriminatorAugmentation(
@@ -467,81 +466,40 @@ class ConditionalGANTrainer:
     
     def _generator_step(self, fake_fluorescent, masks):
         """
-        Generator training step following CellSynthesis methodology:
-        - Adversarial loss (fool discriminator)
-        - Identity loss (when feeding real images through generator)
-        - Structural loss (mask-fluorescent correspondence)
+        PURE CellSynthesis generator step: adversarial loss only
         """
-        # SIMPLIFIED CELLSYNTHESIS APPROACH FOR UNPAIRED DATA
-        # 1. Adversarial loss - fool the discriminator (main loss like CellSynthesis)
+        # CellSynthesis uses ONLY adversarial loss for the generator
+        # No identity loss, no structural loss, no regularization
+        
+        # Adversarial loss - generator tries to fool discriminator
         fake_pred = self.discriminator(fake_fluorescent, masks)
-        g_adv_loss = self.adversarial_loss(fake_pred, target_is_real=True)
-        
-        # 2. Feature matching loss (unpaired alternative to identity loss)
-        # Match statistical features between real and generated distributions
-        real_mean = torch.tensor(-0.65, device=self.device)  # Approximate real data mean
-        gen_mean = fake_fluorescent.mean()
-        feature_matching_loss = F.l1_loss(gen_mean, real_mean)
-        
-        # Simple CellSynthesis-inspired loss: adversarial + light feature matching
-        g_loss = g_adv_loss + 0.1 * feature_matching_loss
+        g_loss = self.adversarial_loss(fake_pred, target_is_real=True)
         
         return {
             'loss': g_loss,
-            'g_adv_loss': g_adv_loss.item(),
-            'g_feature_matching': feature_matching_loss.item()
+            'g_adv_loss': g_loss.item()
         }
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
         """
-        Discriminator training step following CellSynthesis methodology:
-        - Real images with proper conditioning
-        - Fake images with proper conditioning
-        - Balanced loss computation
+        PURE CellSynthesis discriminator step: simple real/fake classification
         """
+        # CellSynthesis uses simple adversarial training
+        # No label smoothing, no complex penalties
         
-        # Real fluorescent images - for unpaired training, discriminate real images
-        # Use the masks from the batch for conditioning (even though unpaired)
-        # This creates a more balanced training dynamic
-        batch_size = real_fluorescent.size(0)
+        # Real images
+        real_pred = self.discriminator(real_fluorescent, masks)
+        d_real_loss = self.adversarial_loss(real_pred, target_is_real=True)
         
-        # For real images, we'll use a mix: some with zero masks, some with actual masks
-        # This prevents the discriminator from simply learning to distinguish based on mask presence
-        if torch.rand(1).item() > 0.5:
-            # 50% chance: use zero masks for real images (unconditional discrimination)
-            real_masks = torch.zeros_like(masks)
-        else:
-            # 50% chance: use actual masks for real images
-            real_masks = masks
-            
-        # CellSynthesis-style discriminator training with label smoothing for stability
-        # Real images: use label smoothing (0.9 instead of 1.0) to improve stability
-        real_pred = self.discriminator(real_fluorescent, real_masks)
-        real_labels = torch.ones_like(real_pred) * 0.9  # Label smoothing
-        d_real_loss = F.binary_cross_entropy_with_logits(real_pred, real_labels)
+        # Fake images
+        fake_pred = self.discriminator(fake_fluorescent.detach(), masks)
+        d_fake_loss = self.adversarial_loss(fake_pred, target_is_real=False)
         
-        # Fake images: use hard labels (0.0) to maintain discrimination
-        fake_pred = self.discriminator(fake_fluorescent, masks)
-        fake_labels = torch.zeros_like(fake_pred)
-        d_fake_loss = F.binary_cross_entropy_with_logits(fake_pred, fake_labels)
-        
-        # Add mask-mismatch penalty to encourage conditioning awareness
-        # If fake image has high intensity where mask is low, penalize discriminator
-        # This forces discriminator to see mask-fluorescent correlations
-        mask_mismatch_penalty = self._compute_mask_mismatch_penalty(fake_fluorescent, masks)
-        
-        # CellSynthesis-style discriminator loss: average of real and fake losses + mask penalty
-        d_loss = (d_real_loss + d_fake_loss) / 2.0 + 0.1 * mask_mismatch_penalty
+        # Simple discriminator loss
+        d_loss = (d_real_loss + d_fake_loss) / 2.0
         
         # Update ADA based on real predictions
         ada_prob = self.ada.update(real_pred, epoch=self.current_epoch)
-        
-        # Emergency ADA reset if discriminator becomes too weak
-        if d_loss.item() < 0.2:  # If discriminator loss is very low
-            self.ada.ada_aug_p = max(0.0, self.ada.ada_aug_p - 0.1)  # Reduce augmentation quickly
-            if d_loss.item() < 0.15:  # If extremely low
-                self.ada.ada_aug_p = 0.0  # Reset to no augmentation
-                print(f"WARNING: Discriminator too weak (loss={d_loss.item():.4f}), resetting ADA to 0.0")
         
         return {
             'loss': d_loss,
@@ -549,54 +507,7 @@ class ConditionalGANTrainer:
             'd_fake_loss': d_fake_loss.item(),
             'ada_prob': ada_prob
         }
-    
-    def _compute_mask_mismatch_penalty(self, fake_fluorescent, masks):
-        """
-        Compute penalty when fake fluorescent images don't match mask conditioning.
-        This encourages the discriminator to notice when images violate mask structure.
-        """
-        # Normalize both to [0, 1] for comparison
-        fake_norm = (fake_fluorescent - fake_fluorescent.min()) / (fake_fluorescent.max() - fake_fluorescent.min() + 1e-8)
-        mask_norm = (masks - masks.min()) / (masks.max() - masks.min() + 1e-8)
-        
-        # Compute mismatch: high intensity where mask is low is bad
-        # Use a threshold to identify mismatches
-        fake_high = (fake_norm > 0.5).float()
-        mask_low = (mask_norm < 0.3).float()
-        
-        # Penalty for high fluorescent signal where mask indicates it shouldn't be
-        mismatch = (fake_high * mask_low).mean()
-        
-        return mismatch
-    
-    def _compute_gradient_penalty(self, real_images, fake_images, masks):
-        """Compute gradient penalty for WGAN-GP style regularization"""
-        batch_size = real_images.size(0)
-        alpha = torch.rand(batch_size, 1, 1, 1, device=self.device)
-        
-        # Interpolate between real and fake images
-        interpolated = alpha * real_images + (1 - alpha) * fake_images
-        interpolated.requires_grad_(True)
-        
-        # Get discriminator output for interpolated images
-        # Use zero masks for interpolated samples to avoid mask conditioning issues
-        d_interpolated = self.discriminator(interpolated, torch.zeros_like(masks))
-        
-        # Compute gradients
-        gradients = torch.autograd.grad(
-            outputs=d_interpolated.sum(),
-            inputs=interpolated,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True
-        )[0]
-        
-        # Calculate gradient penalty
-        gradients = gradients.view(batch_size, -1)
-        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-        
-        return gradient_penalty
-    
+
     def train_epoch(self, dataloader):
         """
         Train for one epoch using CellSynthesis-style alternating optimization
@@ -638,13 +549,12 @@ class ConditionalGANTrainer:
             epoch_d_loss += d_results['loss'].item()
             epoch_ada_prob += d_results['ada_prob']
             
-            # Print progress with unpaired conditional GAN metrics
+            # Print progress with pure CellSynthesis metrics (adversarial only)
             if batch_idx % 50 == 0:
                 current_ada_target = self.ada.ada_target
                 print(f"Batch {batch_idx}/{num_batches}: "
                       f"G_loss: {g_results['loss'].item():.4f} "
-                      f"(adv: {g_results['g_adv_loss']:.4f}, "
-                      f"feat: {g_results['g_feature_matching']:.4f}), "
+                      f"(adv: {g_results['g_adv_loss']:.4f}), "
                       f"D_loss: {d_results['loss'].item():.4f} "
                       f"(real: {d_results['d_real_loss']:.4f}, "
                       f"fake: {d_results['d_fake_loss']:.4f}), "
