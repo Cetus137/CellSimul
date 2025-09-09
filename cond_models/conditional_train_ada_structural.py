@@ -485,9 +485,9 @@ class ConditionalGANTrainer:
         # Penalize if generated image doesn't vary when mask changes
         mask_dependency_loss = self._compute_mask_dependency_loss(fake_fluorescent, masks)
         
-        # Make structural loss heavily dominant to force proper conditioning
-        # Use very low adversarial weight so generator focuses on following mask structure
-        g_loss = 0.1 * g_adv_loss + 0.05 * g_identity_loss + 5.0 * g_structural_loss + 2.0 * mask_dependency_loss
+        # Balanced conditioning - reduced from extreme values for more stable training
+        # Still emphasizes structure but not overwhelming
+        g_loss = 0.2 * g_adv_loss + 0.05 * g_identity_loss + 2.0 * g_structural_loss + 0.8 * mask_dependency_loss
         
         return {
             'loss': g_loss,
@@ -710,6 +710,7 @@ class ConditionalGANTrainer:
             # Save samples and models periodically
             if (epoch + 1) % save_interval == 0:
                 self.save_samples(output_dir, epoch)
+                self.display_samples(epoch)  # Display samples in addition to saving
                 self.save_models(output_dir, epoch)
                 self.save_training_curves(output_dir)
         
@@ -760,6 +761,65 @@ class ConditionalGANTrainer:
             print(f"  Row 2: Distance masks (conditions - white = far from membrane)")
             print(f"  Row 3: Generated fluorescent images (from masks)")
             print(f"  Row 4: Grayscale Overlay (bright = good alignment, dark = poor alignment)")
+    
+    def display_samples(self, epoch):
+        """Display generated samples in a matplotlib window"""
+        self.generator.eval()
+        
+        with torch.no_grad():
+            # Get test samples
+            test_dataloader = torch.utils.data.DataLoader(
+                self.dataset, batch_size=8, shuffle=True
+            )
+            batch = next(iter(test_dataloader))
+            real_fluorescent, masks = batch
+            real_fluorescent = real_fluorescent.to(self.device)
+            masks = masks.to(self.device)
+            
+            # Generate fluorescent images
+            fake_fluorescent = self.generator(masks)
+            
+            # Create grayscale overlay
+            masks_norm = (masks + 1.0) / 2.0
+            fake_norm = (fake_fluorescent + 1.0) / 2.0
+            overlay = (masks_norm + fake_norm) / 2.0
+            
+            # Convert to numpy for display
+            real_np = ((real_fluorescent.cpu() + 1) / 2).clamp(0, 1).numpy()
+            masks_np = ((masks.cpu() + 1) / 2).clamp(0, 1).numpy()
+            fake_np = ((fake_fluorescent.cpu() + 1) / 2).clamp(0, 1).numpy()
+            overlay_np = overlay.cpu().clamp(0, 1).numpy()
+            
+            # Create display
+            fig, axes = plt.subplots(4, 8, figsize=(16, 8))
+            fig.suptitle(f'Epoch {epoch+1} - Conditioning Results', fontsize=14)
+            
+            for i in range(8):
+                # Row 1: Real fluorescent
+                axes[0, i].imshow(real_np[i, 0], cmap='gray')
+                axes[0, i].set_title('Real' if i == 0 else '')
+                axes[0, i].axis('off')
+                
+                # Row 2: Masks
+                axes[1, i].imshow(masks_np[i, 0], cmap='gray')
+                axes[1, i].set_title('Masks' if i == 0 else '')
+                axes[1, i].axis('off')
+                
+                # Row 3: Generated
+                axes[2, i].imshow(fake_np[i, 0], cmap='gray')
+                axes[2, i].set_title('Generated' if i == 0 else '')
+                axes[2, i].axis('off')
+                
+                # Row 4: Overlay
+                axes[3, i].imshow(overlay_np[i, 0], cmap='gray')
+                axes[3, i].set_title('Overlay' if i == 0 else '')
+                axes[3, i].axis('off')
+            
+            plt.tight_layout()
+            plt.show()
+            print(f"Displayed samples for epoch {epoch+1}")
+        
+        self.generator.train()
     
     def save_models(self, output_dir, epoch):
         """Save model checkpoints"""
