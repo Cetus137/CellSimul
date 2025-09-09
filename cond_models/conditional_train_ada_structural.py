@@ -1,12 +1,14 @@
 """
 Conditional GAN Training Script for Fluorescent Microscopy Images
-Following Original CellSynthesis Approach: https://github.com/stegmaierj/CellSynthesis
+Simplified CellSynthesis Approach for Unpaired Data: https://github.com/stegmaierj/CellSynthesis
 
 This script trains a conditional GAN to generate fluorescent cell images
 conditioned on binary cell membrane segmentation masks using PyTorch Lightning
 with Adaptive Discriminator Augmentation (ADA) for stable training.
 
-Uses simple CellSynthesis loss: adversarial_loss + identity_loss (no structural loss)
+Uses simplified CellSynthesis-inspired loss for unpaired data:
+- Adversarial loss (primary, like CellSynthesis)
+- Light feature matching loss (unpaired alternative to identity loss)
 """
 
 import torch
@@ -470,36 +472,24 @@ class ConditionalGANTrainer:
         - Identity loss (when feeding real images through generator)
         - Structural loss (mask-fluorescent correspondence)
         """
-        # UNPAIRED CONDITIONAL GAN APPROACH  
-        # 1. Adversarial loss - fool the discriminator
+        # SIMPLIFIED CELLSYNTHESIS APPROACH FOR UNPAIRED DATA
+        # 1. Adversarial loss - fool the discriminator (main loss like CellSynthesis)
         fake_pred = self.discriminator(fake_fluorescent, masks)
         g_adv_loss = self.adversarial_loss(fake_pred, target_is_real=True)
         
-        # 2. Distribution matching - force generated images to match real fluorescent statistics
-        # Real fluorescent data has specific intensity range and distribution
-        real_target_mean = torch.tensor(-0.65, device=self.device)  # From your data analysis
-        real_target_std = torch.tensor(0.15, device=self.device)
-        
+        # 2. Feature matching loss (unpaired alternative to identity loss)
+        # Match statistical features between real and generated distributions
+        real_mean = torch.tensor(-0.65, device=self.device)  # Approximate real data mean
         gen_mean = fake_fluorescent.mean()
-        gen_std = fake_fluorescent.std()
+        feature_matching_loss = F.l1_loss(gen_mean, real_mean)
         
-        distribution_loss = F.mse_loss(gen_mean, real_target_mean) + \
-                          F.mse_loss(gen_std, real_target_std)
-        
-        # 3. Light self-consistency for stability (using different noise each time)
-        noise_test = torch.randn(fake_fluorescent.size(0), self.latent_dim, device=self.device)
-        test_generated = self.generator(noise_test, masks)
-        # Ensure generator produces realistic intensity ranges
-        range_consistency = torch.abs(test_generated.mean() - real_target_mean)
-        
-        # Weighted combination for unpaired conditional training
-        g_loss = g_adv_loss + 0.5 * distribution_loss + 0.1 * range_consistency
+        # Simple CellSynthesis-inspired loss: adversarial + light feature matching
+        g_loss = g_adv_loss + 0.1 * feature_matching_loss
         
         return {
             'loss': g_loss,
             'g_adv_loss': g_adv_loss.item(),
-            'g_distribution_loss': distribution_loss.item(),
-            'g_range_consistency': range_consistency.item()
+            'g_feature_matching': feature_matching_loss.item()
         }
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
@@ -654,8 +644,7 @@ class ConditionalGANTrainer:
                 print(f"Batch {batch_idx}/{num_batches}: "
                       f"G_loss: {g_results['loss'].item():.4f} "
                       f"(adv: {g_results['g_adv_loss']:.4f}, "
-                      f"dist: {g_results['g_distribution_loss']:.4f}, "
-                      f"range: {g_results['g_range_consistency']:.4f}), "
+                      f"feat: {g_results['g_feature_matching']:.4f}), "
                       f"D_loss: {d_results['loss'].item():.4f} "
                       f"(real: {d_results['d_real_loss']:.4f}, "
                       f"fake: {d_results['d_fake_loss']:.4f}), "
@@ -804,26 +793,16 @@ class ConditionalGANTrainer:
             fake_norm = (fake_fluorescent + 1.0) / 2.0
             overlay = (masks_norm + fake_norm) / 2.0
             
-            # Convert to numpy for display with proper normalization
-            # Real fluorescent: normalize from [-1, 1] to [0, 1] for display
+            # Convert to numpy for display - simple CellSynthesis-style normalization
+            # Normalize all images from [-1, 1] to [0, 1] for consistent display
             real_np = ((real_fluorescent.cpu() + 1) / 2).clamp(0, 1).numpy()
-            
-            # Masks: normalize from [-1, 1] to [0, 1] 
             masks_np = ((masks.cpu() + 1) / 2).clamp(0, 1).numpy()
+            fake_np = ((fake_fluorescent.cpu() + 1) / 2).clamp(0, 1).numpy()
             
-            # Generated fluorescent: normalize to match real fluorescent range for fair comparison
-            # Since real data is in range [-0.976, -0.404], normalize generated similarly
-            fake_min = fake_fluorescent.min()
-            fake_max = fake_fluorescent.max()
-            if fake_max > fake_min:
-                fake_normalized = (fake_fluorescent - fake_min) / (fake_max - fake_min)
-            else:
-                fake_normalized = torch.zeros_like(fake_fluorescent)
-            fake_np = fake_normalized.cpu().clamp(0, 1).numpy()
-            
-            # Create overlay: normalize both to same scale first
+            # Create overlay: average of mask and generated for conditioning visualization
             masks_norm = (masks + 1.0) / 2.0
-            overlay = (masks_norm + fake_normalized.unsqueeze(1) if len(fake_normalized.shape) == 3 else fake_normalized) / 2.0
+            fake_norm = (fake_fluorescent + 1.0) / 2.0
+            overlay = (masks_norm + fake_norm) / 2.0
             overlay_np = overlay.cpu().clamp(0, 1).numpy()
             
             # Create display
