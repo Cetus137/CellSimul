@@ -776,8 +776,11 @@ class ConditionalGANTrainer:
             real_fluorescent = real_fluorescent.to(self.device)
             masks = masks.to(self.device)
             
+            # Generate random noise for generator
+            noise = torch.randn(masks.size(0), 100, device=self.device)
+            
             # Generate fluorescent images
-            fake_fluorescent = self.generator(masks)
+            fake_fluorescent = self.generator(noise, masks)
             
             # Create grayscale overlay
             masks_norm = (masks + 1.0) / 2.0
