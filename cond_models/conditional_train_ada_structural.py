@@ -470,25 +470,36 @@ class ConditionalGANTrainer:
         - Identity loss (when feeding real images through generator)
         - Structural loss (mask-fluorescent correspondence)
         """
-        # UNPAIRED CONDITIONAL GAN APPROACH
+        # UNPAIRED CONDITIONAL GAN APPROACH  
         # 1. Adversarial loss - fool the discriminator
         fake_pred = self.discriminator(fake_fluorescent, masks)
         g_adv_loss = self.adversarial_loss(fake_pred, target_is_real=True)
         
-        # 2. Self-consistency loss - same inputs should produce same outputs
-        # This ensures the generator is deterministic for given (noise, mask) pairs
-        noise_consistency = torch.randn(fake_fluorescent.size(0), self.latent_dim, device=self.device)
-        consistent_generated1 = self.generator(noise_consistency, masks)
-        consistent_generated2 = self.generator(noise_consistency, masks)  # Same inputs
-        g_consistency_loss = self.identity_loss(consistent_generated1, consistent_generated2)
+        # 2. Distribution matching - force generated images to match real fluorescent statistics
+        # Real fluorescent data has specific intensity range and distribution
+        real_target_mean = torch.tensor(-0.65, device=self.device)  # From your data analysis
+        real_target_std = torch.tensor(0.15, device=self.device)
         
-        # Weighted combination: emphasize adversarial training for unpaired data
-        g_loss = g_adv_loss + 0.1 * g_consistency_loss  # Light consistency regularization
+        gen_mean = fake_fluorescent.mean()
+        gen_std = fake_fluorescent.std()
+        
+        distribution_loss = F.mse_loss(gen_mean, real_target_mean) + \
+                          F.mse_loss(gen_std, real_target_std)
+        
+        # 3. Light self-consistency for stability (using different noise each time)
+        noise_test = torch.randn(fake_fluorescent.size(0), self.latent_dim, device=self.device)
+        test_generated = self.generator(noise_test, masks)
+        # Ensure generator produces realistic intensity ranges
+        range_consistency = torch.abs(test_generated.mean() - real_target_mean)
+        
+        # Weighted combination for unpaired conditional training
+        g_loss = g_adv_loss + 0.5 * distribution_loss + 0.1 * range_consistency
         
         return {
             'loss': g_loss,
             'g_adv_loss': g_adv_loss.item(),
-            'g_consistency_loss': g_consistency_loss.item()
+            'g_distribution_loss': distribution_loss.item(),
+            'g_range_consistency': range_consistency.item()
         }
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
@@ -643,7 +654,8 @@ class ConditionalGANTrainer:
                 print(f"Batch {batch_idx}/{num_batches}: "
                       f"G_loss: {g_results['loss'].item():.4f} "
                       f"(adv: {g_results['g_adv_loss']:.4f}, "
-                      f"cons: {g_results['g_consistency_loss']:.4f}), "
+                      f"dist: {g_results['g_distribution_loss']:.4f}, "
+                      f"range: {g_results['g_range_consistency']:.4f}), "
                       f"D_loss: {d_results['loss'].item():.4f} "
                       f"(real: {d_results['d_real_loss']:.4f}, "
                       f"fake: {d_results['d_fake_loss']:.4f}), "
@@ -792,10 +804,26 @@ class ConditionalGANTrainer:
             fake_norm = (fake_fluorescent + 1.0) / 2.0
             overlay = (masks_norm + fake_norm) / 2.0
             
-            # Convert to numpy for display
+            # Convert to numpy for display with proper normalization
+            # Real fluorescent: normalize from [-1, 1] to [0, 1] for display
             real_np = ((real_fluorescent.cpu() + 1) / 2).clamp(0, 1).numpy()
+            
+            # Masks: normalize from [-1, 1] to [0, 1] 
             masks_np = ((masks.cpu() + 1) / 2).clamp(0, 1).numpy()
-            fake_np = ((fake_fluorescent.cpu() + 1) / 2).clamp(0, 1).numpy()
+            
+            # Generated fluorescent: normalize to match real fluorescent range for fair comparison
+            # Since real data is in range [-0.976, -0.404], normalize generated similarly
+            fake_min = fake_fluorescent.min()
+            fake_max = fake_fluorescent.max()
+            if fake_max > fake_min:
+                fake_normalized = (fake_fluorescent - fake_min) / (fake_max - fake_min)
+            else:
+                fake_normalized = torch.zeros_like(fake_fluorescent)
+            fake_np = fake_normalized.cpu().clamp(0, 1).numpy()
+            
+            # Create overlay: normalize both to same scale first
+            masks_norm = (masks + 1.0) / 2.0
+            overlay = (masks_norm + fake_normalized.unsqueeze(1) if len(fake_normalized.shape) == 3 else fake_normalized) / 2.0
             overlay_np = overlay.cpu().clamp(0, 1).numpy()
             
             # Create display
