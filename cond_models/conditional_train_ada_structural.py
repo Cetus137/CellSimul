@@ -428,6 +428,39 @@ class ConditionalGANTrainer:
             # Discriminator training step
             return self._discriminator_step(fake_fluorescent.detach(), real_fluorescent, masks)
     
+    def _compute_mask_dependency_loss(self, generated_images, masks):
+        """
+        Compute loss to ensure generated images depend on mask structure
+        This prevents the generator from ignoring mask conditioning
+        """
+        # Compute spatial correlation between generated images and masks
+        batch_size = generated_images.size(0)
+        
+        # Flatten spatial dimensions for correlation
+        gen_flat = generated_images.view(batch_size, -1)  # [B, H*W]
+        mask_flat = masks.view(batch_size, -1)  # [B, H*W]
+        
+        # Compute correlation coefficient for each sample
+        correlations = []
+        for i in range(batch_size):
+            # Center the data
+            gen_centered = gen_flat[i] - gen_flat[i].mean()
+            mask_centered = mask_flat[i] - mask_flat[i].mean()
+            
+            # Compute correlation
+            numerator = torch.sum(gen_centered * mask_centered)
+            denominator = torch.sqrt(torch.sum(gen_centered**2) * torch.sum(mask_centered**2)) + 1e-8
+            correlation = numerator / denominator
+            correlations.append(correlation)
+        
+        # Average correlation across batch
+        avg_correlation = torch.stack(correlations).mean()
+        
+        # Loss = 1 - |correlation| (we want high absolute correlation)
+        mask_dependency_loss = 1.0 - torch.abs(avg_correlation)
+        
+        return mask_dependency_loss
+    
     def _generator_step(self, fake_fluorescent, masks):
         """
         Generator training step following CellSynthesis methodology:
@@ -448,15 +481,20 @@ class ConditionalGANTrainer:
         # Structural loss - enforce mask-fluorescent correspondence  
         g_structural_loss = self.structural_loss(fake_fluorescent, masks)
         
-        # Make structural loss dominant to force proper conditioning
-        # Start with moderate weight to see variation, then can increase
-        g_loss = 0.4 * g_adv_loss + 0.1 * g_identity_loss + 1.0 * g_structural_loss
+        # Add explicit mask dependency penalty
+        # Penalize if generated image doesn't vary when mask changes
+        mask_dependency_loss = self._compute_mask_dependency_loss(fake_fluorescent, masks)
+        
+        # Make structural loss heavily dominant to force proper conditioning
+        # Use very low adversarial weight so generator focuses on following mask structure
+        g_loss = 0.1 * g_adv_loss + 0.05 * g_identity_loss + 5.0 * g_structural_loss + 2.0 * mask_dependency_loss
         
         return {
             'loss': g_loss,
             'g_adv_loss': g_adv_loss.item(),
             'g_structural_loss': g_structural_loss.item(),
-            'g_identity_loss': g_identity_loss.item()
+            'g_identity_loss': g_identity_loss.item(),
+            'g_mask_dependency_loss': mask_dependency_loss.item()
         }
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
@@ -606,7 +644,8 @@ class ConditionalGANTrainer:
                       f"G_loss: {g_results['loss'].item():.4f} "
                       f"(adv: {g_results['g_adv_loss']:.4f}, "
                       f"id: {g_results['g_identity_loss']:.4f}, "
-                      f"struct: {g_results['g_structural_loss']:.4f}), "
+                      f"struct: {g_results['g_structural_loss']:.4f}, "
+                      f"mask_dep: {g_results['g_mask_dependency_loss']:.4f}), "
                       f"D_loss: {d_results['loss'].item():.4f} "
                       f"(real: {d_results['d_real_loss']:.4f}, "
                       f"fake: {d_results['d_fake_loss']:.4f}), "
@@ -697,20 +736,16 @@ class ConditionalGANTrainer:
             
             print(f"Generated fluorescent range: [{fake_fluorescent.min():.3f}, {fake_fluorescent.max():.3f}]")
             
-            # Create red-green overlay visualization 
+            # Create grayscale overlay visualization 
             # Normalize both to [0,1] for proper overlay
             masks_norm = (masks + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
             fake_norm = (fake_fluorescent + 1.0) / 2.0
             
-            # Create RGB overlay: Red channel = masks, Green channel = generated
-            # Where they overlap, you'll see yellow/orange
-            batch_size = masks.size(0)
-            overlay = torch.zeros(batch_size, 3, masks.size(2), masks.size(3))
-            overlay[:, 0, :, :] = masks_norm.squeeze(1)  # Red channel = masks
-            overlay[:, 1, :, :] = fake_norm.squeeze(1)   # Green channel = generated
-            overlay[:, 2, :, :] = 0.0                    # Blue channel = empty
+            # Create simple grayscale overlay by averaging normalized mask and generated
+            # Bright areas = good alignment, dark areas = poor alignment
+            overlay = (masks_norm + fake_norm) / 2.0
             
-            # Save comparison: real_fluorescent -> masks -> generated -> red-green overlay
+            # Save comparison: real_fluorescent -> masks -> generated -> grayscale overlay
             comparison = torch.cat([
                 real_fluorescent.cpu(),
                 masks.cpu(),
@@ -724,7 +759,7 @@ class ConditionalGANTrainer:
             print(f"  Row 1: Real fluorescent images (targets)")
             print(f"  Row 2: Distance masks (conditions - white = far from membrane)")
             print(f"  Row 3: Generated fluorescent images (from masks)")
-            print(f"  Row 4: Red-Green Overlay (Red = masks, Green = generated, Yellow = good alignment)")
+            print(f"  Row 4: Grayscale Overlay (bright = good alignment, dark = poor alignment)")
     
     def save_models(self, output_dir, epoch):
         """Save model checkpoints"""
