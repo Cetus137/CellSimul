@@ -371,10 +371,10 @@ class ConditionalGANTrainer:
         self.ada_target = ada_target
         self.ada_update = ada_update
         
-        print(f"Initialized ConditionalGANTrainer with PURE CellSynthesis approach:")
+        print(f"Initialized ConditionalGANTrainer with CellSynthesis + conditioning enforcement:")
         print(f"  Generator LR: {lr_g}")
         print(f"  Discriminator LR: {lr_d}")
-        print(f"  Loss: Adversarial only (like original CellSynthesis)")
+        print(f"  Loss: Adversarial + conditioning (prevents mask ignoring)")
         print(f"  ADA Target: {ada_target}")
         print(f"  Device: {self.device}")
         
@@ -466,18 +466,32 @@ class ConditionalGANTrainer:
     
     def _generator_step(self, fake_fluorescent, masks):
         """
-        PURE CellSynthesis generator step: adversarial loss only
+        PURE CellSynthesis generator step with conditioning enforcement
         """
-        # CellSynthesis uses ONLY adversarial loss for the generator
-        # No identity loss, no structural loss, no regularization
-        
-        # Adversarial loss - generator tries to fool discriminator
+        # CellSynthesis adversarial loss
         fake_pred = self.discriminator(fake_fluorescent, masks)
-        g_loss = self.adversarial_loss(fake_pred, target_is_real=True)
+        g_adv_loss = self.adversarial_loss(fake_pred, target_is_real=True)
+        
+        # Add simple conditioning loss to prevent ignoring masks
+        # Generate with different masks to ensure conditioning dependency
+        batch_size = fake_fluorescent.size(0)
+        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
+        
+        # Generate with shuffled masks - should produce different outputs
+        shuffled_indices = torch.randperm(batch_size, device=self.device)
+        shuffled_masks = masks[shuffled_indices]
+        fake_with_shuffled = self.generator(noise, shuffled_masks)
+        
+        # Conditioning loss: different masks should produce different outputs
+        conditioning_loss = -F.mse_loss(fake_fluorescent, fake_with_shuffled)  # Negative to encourage difference
+        
+        # Combined loss: adversarial + conditioning enforcement
+        g_loss = g_adv_loss + 0.1 * conditioning_loss
         
         return {
             'loss': g_loss,
-            'g_adv_loss': g_loss.item()
+            'g_adv_loss': g_adv_loss.item(),
+            'g_conditioning_loss': conditioning_loss.item()
         }
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
@@ -549,12 +563,13 @@ class ConditionalGANTrainer:
             epoch_d_loss += d_results['loss'].item()
             epoch_ada_prob += d_results['ada_prob']
             
-            # Print progress with pure CellSynthesis metrics (adversarial only)
+            # Print progress with conditioning-aware CellSynthesis metrics
             if batch_idx % 50 == 0:
                 current_ada_target = self.ada.ada_target
                 print(f"Batch {batch_idx}/{num_batches}: "
                       f"G_loss: {g_results['loss'].item():.4f} "
-                      f"(adv: {g_results['g_adv_loss']:.4f}), "
+                      f"(adv: {g_results['g_adv_loss']:.4f}, "
+                      f"cond: {g_results['g_conditioning_loss']:.4f}), "
                       f"D_loss: {d_results['loss'].item():.4f} "
                       f"(real: {d_results['d_real_loss']:.4f}, "
                       f"fake: {d_results['d_fake_loss']:.4f}), "
