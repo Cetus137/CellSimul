@@ -23,6 +23,7 @@ from collections import OrderedDict
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from torchvision.utils import save_image
+from torch.cuda.amp import autocast, GradScaler
 
 import sys
 import os
@@ -75,7 +76,7 @@ class CycleGANTrainer:
     
     def __init__(self, mask_dir, fluorescent_dir, image_size=256, 
                  cycle_loss_weight=10.0, identity_loss_weight=0.5,
-                 lr=0.0002, beta1=0.5, device=None):
+                 lr=0.0002, beta1=0.5, device=None, pretrained_checkpoint=None):
         """
         Initialize CycleGAN trainer
         
@@ -88,6 +89,7 @@ class CycleGANTrainer:
             lr: Learning rate
             beta1: Adam optimizer beta1 parameter
             device: Training device
+            pretrained_checkpoint: Path to pretrained checkpoint file (.pth)
         """
         
         self.mask_dir = mask_dir
@@ -144,6 +146,11 @@ class CycleGANTrainer:
             self.optimizer_D_M, lr_lambda=lambda epoch: 1.0 - max(0, epoch - 100) / 100
         )
         
+        # Mixed precision scalers (for faster training)
+        self.scaler_G = GradScaler() if self.device.type == 'cuda' else None
+        self.scaler_D_F = GradScaler() if self.device.type == 'cuda' else None
+        self.scaler_D_M = GradScaler() if self.device.type == 'cuda' else None
+        
         # Image buffers for discriminator stability
         self.fake_F_buffer = ImageBuffer(50)
         self.fake_M_buffer = ImageBuffer(50)
@@ -165,9 +172,52 @@ class CycleGANTrainer:
         self.g_losses = []
         self.d_f_losses = []
         self.d_m_losses = []
+        self.start_epoch = 0
+        
+        # Load pretrained checkpoint if provided
+        if pretrained_checkpoint is not None:
+            self.load_checkpoint(pretrained_checkpoint)
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load pretrained checkpoint"""
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+        
+        print(f"\nLoading pretrained checkpoint from: {checkpoint_path}")
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model states
+            self.G_M2F.load_state_dict(checkpoint['G_M2F_state_dict'])
+            self.G_F2M.load_state_dict(checkpoint['G_F2M_state_dict'])
+            self.D_F.load_state_dict(checkpoint['D_F_state_dict'])
+            self.D_M.load_state_dict(checkpoint['D_M_state_dict'])
+            
+            # Load optimizer states
+            self.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
+            self.optimizer_D_F.load_state_dict(checkpoint['optimizer_D_F_state_dict'])
+            self.optimizer_D_M.load_state_dict(checkpoint['optimizer_D_M_state_dict'])
+            
+            # Load training history
+            self.g_losses = checkpoint.get('g_losses', [])
+            self.d_f_losses = checkpoint.get('d_f_losses', [])
+            self.d_m_losses = checkpoint.get('d_m_losses', [])
+            
+            # Set starting epoch
+            self.start_epoch = checkpoint.get('epoch', 0) + 1
+            
+            print(f"Successfully loaded checkpoint from epoch {checkpoint.get('epoch', 0)}")
+            print(f"Resuming training from epoch {self.start_epoch}")
+            print(f"Loaded training history: {len(self.g_losses)} epochs")
+            
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            print("Starting training from scratch...")
+            self.start_epoch = 0
     
     def train_step(self, real_masks, real_fluorescent):
-        """Single training step"""
+        """Single training step with mixed precision"""
         batch_size = real_masks.size(0)
         
         # Set model modes
@@ -181,71 +231,92 @@ class CycleGANTrainer:
         # ------------------
         self.optimizer_G.zero_grad()
         
-        # Identity loss (optional - can be disabled by setting weight to 0)
-        same_F = self.G_M2F(real_fluorescent)  # G_M2F should be identity for fluorescent input
-        same_M = self.G_F2M(real_masks)        # G_F2M should be identity for mask input
+        with autocast(enabled=self.scaler_G is not None):
+            # Identity loss (optional - can be disabled by setting weight to 0)
+            same_F = self.G_M2F(real_fluorescent)  # G_M2F should be identity for fluorescent input
+            same_M = self.G_F2M(real_masks)        # G_F2M should be identity for mask input
+            
+            # Forward cycle: Mask → Fluorescent → reconstructed Mask
+            fake_fluorescent = self.G_M2F(real_masks)
+            reconstructed_masks = self.G_F2M(fake_fluorescent)
+            
+            # Backward cycle: Fluorescent → Mask → reconstructed Fluorescent
+            fake_masks = self.G_F2M(real_fluorescent)
+            reconstructed_fluorescent = self.G_M2F(fake_masks)
+            
+            # Adversarial losses
+            pred_fake_F = self.D_F(fake_fluorescent)
+            pred_fake_M = self.D_M(fake_masks)
+            
+            # Generator losses
+            g_m2f_loss = self.criterion.generator_loss(
+                pred_fake_F, real_masks, real_fluorescent, fake_fluorescent, fake_masks,
+                reconstructed_masks, reconstructed_fluorescent, same_M, same_F
+            )
+            
+            g_f2m_loss = self.criterion.generator_loss(
+                pred_fake_M, real_fluorescent, real_masks, fake_masks, fake_fluorescent,
+                reconstructed_fluorescent, reconstructed_masks, same_F, same_M
+            )
+            
+            # Total generator loss
+            g_total_loss = g_m2f_loss['total_loss'] + g_f2m_loss['total_loss']
         
-        # Forward cycle: Mask → Fluorescent → reconstructed Mask
-        fake_fluorescent = self.G_M2F(real_masks)
-        reconstructed_masks = self.G_F2M(fake_fluorescent)
-        
-        # Backward cycle: Fluorescent → Mask → reconstructed Fluorescent
-        fake_masks = self.G_F2M(real_fluorescent)
-        reconstructed_fluorescent = self.G_M2F(fake_masks)
-        
-        # Adversarial losses
-        pred_fake_F = self.D_F(fake_fluorescent)
-        pred_fake_M = self.D_M(fake_masks)
-        
-        # Generator losses
-        g_m2f_loss = self.criterion.generator_loss(
-            pred_fake_F, real_masks, real_fluorescent, fake_fluorescent, fake_masks,
-            reconstructed_masks, reconstructed_fluorescent, same_M, same_F
-        )
-        
-        g_f2m_loss = self.criterion.generator_loss(
-            pred_fake_M, real_fluorescent, real_masks, fake_masks, fake_fluorescent,
-            reconstructed_fluorescent, reconstructed_masks, same_F, same_M
-        )
-        
-        # Total generator loss
-        g_total_loss = g_m2f_loss['total_loss'] + g_f2m_loss['total_loss']
-        g_total_loss.backward()
-        self.optimizer_G.step()
+        if self.scaler_G is not None:
+            self.scaler_G.scale(g_total_loss).backward()
+            self.scaler_G.step(self.optimizer_G)
+            self.scaler_G.update()
+        else:
+            g_total_loss.backward()
+            self.optimizer_G.step()
         
         # ------------------
         # Train Discriminator F (Fluorescent)
         # ------------------
         self.optimizer_D_F.zero_grad()
         
-        # Real fluorescent images
-        pred_real_F = self.D_F(real_fluorescent)
+        with autocast(enabled=self.scaler_D_F is not None):
+            # Real fluorescent images
+            pred_real_F = self.D_F(real_fluorescent)
+            
+            # Fake fluorescent images from buffer
+            fake_fluorescent_buffer = self.fake_F_buffer.push_and_pop(fake_fluorescent)
+            pred_fake_F = self.D_F(fake_fluorescent_buffer.detach())
+            
+            # Discriminator F loss
+            d_f_loss = self.criterion.discriminator_loss(pred_real_F, pred_fake_F)
         
-        # Fake fluorescent images from buffer
-        fake_fluorescent_buffer = self.fake_F_buffer.push_and_pop(fake_fluorescent)
-        pred_fake_F = self.D_F(fake_fluorescent_buffer.detach())
-        
-        # Discriminator F loss
-        d_f_loss = self.criterion.discriminator_loss(pred_real_F, pred_fake_F)
-        d_f_loss.backward()
-        self.optimizer_D_F.step()
+        if self.scaler_D_F is not None:
+            self.scaler_D_F.scale(d_f_loss).backward()
+            self.scaler_D_F.step(self.optimizer_D_F)
+            self.scaler_D_F.update()
+        else:
+            d_f_loss.backward()
+            self.optimizer_D_F.step()
         
         # ------------------
         # Train Discriminator M (Mask)
         # ------------------
         self.optimizer_D_M.zero_grad()
         
-        # Real mask images
-        pred_real_M = self.D_M(real_masks)
+        with autocast(enabled=self.scaler_D_M is not None):
+            # Real mask images
+            pred_real_M = self.D_M(real_masks)
+            
+            # Fake mask images from buffer
+            fake_masks_buffer = self.fake_M_buffer.push_and_pop(fake_masks)
+            pred_fake_M = self.D_M(fake_masks_buffer.detach())
+            
+            # Discriminator M loss
+            d_m_loss = self.criterion.discriminator_loss(pred_real_M, pred_fake_M)
         
-        # Fake mask images from buffer
-        fake_masks_buffer = self.fake_M_buffer.push_and_pop(fake_masks)
-        pred_fake_M = self.D_M(fake_masks_buffer.detach())
-        
-        # Discriminator M loss
-        d_m_loss = self.criterion.discriminator_loss(pred_real_M, pred_fake_M)
-        d_m_loss.backward()
-        self.optimizer_D_M.step()
+        if self.scaler_D_M is not None:
+            self.scaler_D_M.scale(d_m_loss).backward()
+            self.scaler_D_M.step(self.optimizer_D_M)
+            self.scaler_D_M.update()
+        else:
+            d_m_loss.backward()
+            self.optimizer_D_M.step()
         
         return {
             'g_loss': g_total_loss.item(),
@@ -257,7 +328,7 @@ class CycleGANTrainer:
             'd_m_loss': d_m_loss.item()
         }
     
-    def train(self, num_epochs, batch_size, save_interval=10, output_dir='./cyclegan_outputs'):
+    def train(self, num_epochs, batch_size, save_interval=10, output_dir='./cyclegan_outputs', num_workers=4):
         """Main training loop"""
         
         # Create output directory
@@ -265,17 +336,18 @@ class CycleGANTrainer:
         
         # Create dataloader
         dataloader = DataLoader(
-            self.dataset, batch_size=batch_size, shuffle=True, num_workers=0
+            self.dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
         )
         
         print(f"\nStarting CycleGAN training:")
         print(f"  Epochs: {num_epochs}")
+        print(f"  Starting from epoch: {self.start_epoch + 1}")
         print(f"  Batch size: {batch_size}")
         print(f"  Batches per epoch: {len(dataloader)}")
         print(f"  Save interval: {save_interval}")
         print(f"  Output directory: {output_dir}")
         
-        for epoch in range(num_epochs):
+        for epoch in range(self.start_epoch, self.start_epoch + num_epochs):
             epoch_g_loss = 0
             epoch_d_f_loss = 0
             epoch_d_m_loss = 0
@@ -293,7 +365,7 @@ class CycleGANTrainer:
                 
                 # Print progress
                 if batch_idx % 25 == 0:
-                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(dataloader)}: "
+                    print(f"Epoch {epoch+1}/{self.start_epoch + num_epochs}, Batch {batch_idx}/{len(dataloader)}: "
                           f"G: {losses['g_loss']:.4f} "
                           f"(adv: {losses['g_m2f_adv']:.3f}+{losses['g_f2m_adv']:.3f}, "
                           f"cycle: {losses['g_cycle']:.3f}, id: {losses['g_identity']:.3f}), "
@@ -347,18 +419,36 @@ class CycleGANTrainer:
             reconstructed_masks = self.G_F2M(fake_fluorescent)
             reconstructed_fluorescent = self.G_M2F(fake_masks)
             
+            # Normalize each tensor to [0, 1] range for proper visualization
+            def normalize_tensor(tensor):
+                """Normalize tensor to [0, 1] range"""
+                # Clamp to handle any extreme values
+                tensor = torch.clamp(tensor, -1, 1)
+                # Convert from [-1, 1] to [0, 1]
+                return (tensor + 1.0) / 2.0
+            
+            # Apply normalization to all tensors
+            real_masks_norm = normalize_tensor(real_masks.cpu())
+            fake_fluorescent_norm = normalize_tensor(fake_fluorescent.cpu())
+            reconstructed_masks_norm = normalize_tensor(reconstructed_masks.cpu())
+            real_fluorescent_norm = normalize_tensor(real_fluorescent.cpu())
+            fake_masks_norm = normalize_tensor(fake_masks.cpu())
+            reconstructed_fluorescent_norm = normalize_tensor(reconstructed_fluorescent.cpu())
+            
             # Create comparison
             comparison = torch.cat([
-                real_masks.cpu(),              # Row 1: Real masks
-                fake_fluorescent.cpu(),        # Row 2: Generated fluorescent (M→F)
-                reconstructed_masks.cpu(),     # Row 3: Reconstructed masks (M→F→M)
-                real_fluorescent.cpu(),        # Row 4: Real fluorescent
-                fake_masks.cpu(),              # Row 5: Generated masks (F→M)
-                reconstructed_fluorescent.cpu() # Row 6: Reconstructed fluorescent (F→M→F)
+                real_masks_norm,               # Row 1: Real masks
+                fake_fluorescent_norm,         # Row 2: Generated fluorescent (M→F)
+                reconstructed_masks_norm,      # Row 3: Reconstructed masks (M→F→M)
+                real_fluorescent_norm,         # Row 4: Real fluorescent
+                fake_masks_norm,               # Row 5: Generated masks (F→M)
+                reconstructed_fluorescent_norm # Row 6: Reconstructed fluorescent (F→M→F)
             ], dim=0)
             
             save_path = os.path.join(output_dir, f'cyclegan_samples_epoch_{epoch+1}.png')
-            save_image(comparison, save_path, nrow=real_masks.size(0), normalize=True)
+            # Use normalize=False since we've already normalized manually to [0,1]
+            # This ensures the output PNG will have proper [0,255] values
+            save_image(comparison, save_path, nrow=real_masks.size(0), normalize=False)
             
             print(f"Saved CycleGAN samples to {save_path}")
             print(f"  Row 1: Real masks")
@@ -470,8 +560,24 @@ def main():
                       help='Device to use (cuda/cpu)')
     parser.add_argument('--save_interval', type=int, default=1,
                       help='Interval for saving checkpoints and samples')
+    parser.add_argument('--pretrained_checkpoint', type=str, default=None,
+                      help='Path to pretrained checkpoint file (.pth) to resume training from')
+    parser.add_argument('--fast_mode', action='store_true',
+                      help='Enable fast mode: larger batch size, higher learning rate, reduced residual blocks')
+    parser.add_argument('--num_workers', type=int, default=4,
+                      help='Number of data loader workers')
     
     args = parser.parse_args()
+    
+    # Apply fast mode optimizations
+    if args.fast_mode:
+        print("Fast mode enabled - using optimized settings:")
+        args.batch_size = max(args.batch_size, 8)  # Increase batch size
+        args.lr = min(args.lr * 2, 0.0004)  # Increase learning rate
+        args.save_interval = max(args.save_interval, 5)  # Save less frequently
+        print(f"  Batch size: {args.batch_size}")
+        print(f"  Learning rate: {args.lr}")
+        print(f"  Save interval: {args.save_interval}")
     
     # Create CycleGAN trainer
     trainer = CycleGANTrainer(
@@ -481,7 +587,8 @@ def main():
         cycle_loss_weight=args.cycle_loss_weight,
         identity_loss_weight=args.identity_loss_weight,
         lr=args.lr,
-        device=args.device
+        device=args.device,
+        pretrained_checkpoint=args.pretrained_checkpoint
     )
     
     # Train
@@ -489,7 +596,8 @@ def main():
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         save_interval=args.save_interval,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        num_workers=args.num_workers
     )
 
 
