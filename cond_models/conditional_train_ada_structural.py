@@ -1,15 +1,15 @@
 """
-PURE CellSynthesis Conditional GAN Training
+PURE CellSynthesis Mask-Only GAN Training
 
 This module implements a conditional GAN following the exact CellSynthesis methodology:
-- Generator: Takes noise + condition (distance mask) -> generates fluorescent image
+- Generator: Takes ONLY distance masks -> generates fluorescent images (NO noise vector)
 - Discriminator: Classifies real vs fake fluorescent images given masks
 - Loss: Pure adversarial loss only (like original CellSynthesis)
 - Training: Alternating generator/discriminator updates
 - Augmentation: ADA (Adaptive Discriminator Augmentation) for stability
 
-CellSynthesis approach simplified for fluorescent image generation from distance masks.
-No complex losses, no identity loss, no structural loss - just adversarial training.
+Pure CellSynthesis approach: deterministic mask-to-image translation.
+No noise vector, no complex losses, no identity loss - just mask-to-image generation.
 """
 
 import torch
@@ -30,7 +30,7 @@ from torchvision.utils import save_image
 from PIL import Image
 
 # Import our conditional models
-from conditional_generator import ConditionalGenerator, SimpleConditionalGenerator
+from mask_only_generator import MaskOnlyGenerator, SimpleMaskOnlyGenerator
 from conditional_discriminator import ConditionalDiscriminator, SimpleConditionalDiscriminator
 from conditional_dataloader import ConditionalImageDataset, SingleDirectoryConditionalDataset
 from unpaired_conditional_dataloader import UnpairedConditionalImageDataset
@@ -269,15 +269,14 @@ class ConditionalGANTrainer:
     with structural loss for mask conditioning
     """
     
-    def __init__(self, fluorescent_dir, mask_dir, latent_dim=100, image_size=256, 
+    def __init__(self, fluorescent_dir, mask_dir, image_size=256, 
                  lr_g=0.0002, lr_d=0.0002, device=None, use_simple_models=False,
                  ada_target=0.1, ada_update=0.05):
         """
-        Initialize the conditional GAN trainer with structural loss
+        Initialize the mask-only GAN trainer following CellSynthesis methodology
         """
         self.fluorescent_dir = fluorescent_dir
         self.mask_dir = mask_dir
-        self.latent_dim = latent_dim
         self.image_size = image_size
         self.lr_g = lr_g
         self.lr_d = lr_d
@@ -319,15 +318,15 @@ class ConditionalGANTrainer:
             # Fallback to mask-only if unpaired doesn't work
             self.dataset = MaskOnlyDataset(mask_dir, image_size)
         
-        # Initialize models
+        # Initialize models (mask-only generators following CellSynthesis)
         if use_simple_models:
-            self.generator = SimpleConditionalGenerator(latent_dim=latent_dim).to(self.device)
+            self.generator = SimpleMaskOnlyGenerator().to(self.device)
             self.discriminator = SimpleConditionalDiscriminator().to(self.device)
-            print("Using simplified conditional models")
+            print("Using simplified mask-only models (CellSynthesis style)")
         else:
-            self.generator = ConditionalGenerator(latent_dim=latent_dim).to(self.device)
+            self.generator = MaskOnlyGenerator().to(self.device)
             self.discriminator = ConditionalDiscriminator().to(self.device)
-            print("Using full conditional models")
+            print("Using full mask-only models (CellSynthesis style)")
         
         # Initialize weights
         self._init_weights()
@@ -408,8 +407,8 @@ class ConditionalGANTrainer:
     
     def training_step(self, batch, optimizer_idx):
         """
-        Training step for unpaired conditional generation
-        Generate fluorescent images from masks, discriminate against real fluorescent
+        Training step for mask-only conditional generation following CellSynthesis
+        Generate fluorescent images directly from masks (no noise)
         
         Args:
             batch: Batch containing (real_fluorescent, masks) from unpaired dataset
@@ -418,11 +417,8 @@ class ConditionalGANTrainer:
         real_fluorescent, masks = batch  # Unpaired real fluorescent and masks
         batch_size = masks.size(0)
         
-        # Generate random noise
-        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
-        
-        # Generate fake fluorescent images from masks
-        fake_fluorescent = self.generator(noise, masks)
+        # Generate fake fluorescent images directly from masks (CellSynthesis style)
+        fake_fluorescent = self.generator(masks)
         
         if optimizer_idx == 0:
             # Generator training step
@@ -475,12 +471,11 @@ class ConditionalGANTrainer:
         # Add simple conditioning loss to prevent ignoring masks
         # Generate with different masks to ensure conditioning dependency
         batch_size = fake_fluorescent.size(0)
-        noise = torch.randn(batch_size, self.latent_dim, device=self.device)
         
         # Generate with shuffled masks - should produce different outputs
         shuffled_indices = torch.randperm(batch_size, device=self.device)
         shuffled_masks = masks[shuffled_indices]
-        fake_with_shuffled = self.generator(noise, shuffled_masks)
+        fake_with_shuffled = self.generator(shuffled_masks)
         
         # Conditioning loss: different masks should produce different outputs
         conditioning_loss = -F.mse_loss(fake_fluorescent, fake_with_shuffled)  # Negative to encourage difference
@@ -655,9 +650,8 @@ class ConditionalGANTrainer:
             print(f"Real fluorescent range: [{real_fluorescent.min():.3f}, {real_fluorescent.max():.3f}]")
             print(f"Masks range: [{masks.min():.3f}, {masks.max():.3f}]")
             
-            # Generate fluorescent images from masks
-            noise = torch.randn(masks.size(0), self.latent_dim, device=self.device)
-            fake_fluorescent = self.generator(noise, masks)
+            # Generate fluorescent images directly from masks (CellSynthesis style)
+            fake_fluorescent = self.generator(masks)
             
             print(f"Generated fluorescent range: [{fake_fluorescent.min():.3f}, {fake_fluorescent.max():.3f}]")
             
@@ -707,11 +701,8 @@ class ConditionalGANTrainer:
             real_fluorescent = real_fluorescent.to(self.device)
             masks = masks.to(self.device)
             
-            # Generate random noise for generator
-            noise = torch.randn(masks.size(0), 100, device=self.device)
-            
-            # Generate fluorescent images
-            fake_fluorescent = self.generator(noise, masks)
+            # Generate fluorescent images directly from masks (CellSynthesis style)
+            fake_fluorescent = self.generator(masks)
             
             # Create grayscale overlay
             masks_norm = (masks + 1.0) / 2.0
@@ -855,8 +846,8 @@ class ConditionalGANTrainer:
 
 
 def main():
-    """Main training function for unpaired conditional generation"""
-    parser = argparse.ArgumentParser(description='Train Conditional GAN with ADA and Structural Loss')
+    """Main training function for mask-only conditional generation (CellSynthesis style)"""
+    parser = argparse.ArgumentParser(description='Train Mask-Only GAN following CellSynthesis methodology')
     parser.add_argument('--fluorescent_dir', type=str, required=True,
                       help='Directory containing real fluorescent images (for discriminator)')
     parser.add_argument('--mask_dir', type=str, required=True,
@@ -868,17 +859,15 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16,
                       help='Batch size')
     parser.add_argument('--lr_g', type=float, default=0.0002,
-                      help='Generator learning rate (conservative for stability)')
+                      help='Generator learning rate')
     parser.add_argument('--lr_d', type=float, default=0.0002,
-                      help='Discriminator learning rate (conservative for stability)')
-    parser.add_argument('--latent_dim', type=int, default=100,
-                      help='Latent dimension')
+                      help='Discriminator learning rate')
     parser.add_argument('--image_size', type=int, default=256,
                       help='Image size')
     parser.add_argument('--ada_target', type=float, default=0.1,
-                      help='ADA target accuracy (very low for maximum conditioning learning)')
+                      help='ADA target accuracy')
     parser.add_argument('--ada_update', type=float, default=0.05,
-                      help='ADA update step size (CellSynthesis default)')
+                      help='ADA update step size')
     parser.add_argument('--use_simple_models', action='store_true',
                       help='Use simplified models')
     parser.add_argument('--device', type=str, default=None,
@@ -886,11 +875,10 @@ def main():
     
     args = parser.parse_args()
     
-    # Create trainer for unpaired conditional generation
+    # Create trainer for mask-only conditional generation (CellSynthesis style)
     trainer = ConditionalGANTrainer(
         fluorescent_dir=args.fluorescent_dir,  # Real fluorescent images
         mask_dir=args.mask_dir,                # Distance masks as conditions
-        latent_dim=args.latent_dim,
         image_size=args.image_size,
         lr_g=args.lr_g,
         lr_d=args.lr_d,
