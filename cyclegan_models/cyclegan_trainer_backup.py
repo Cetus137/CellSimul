@@ -5,13 +5,13 @@ This trainer implements the complete CycleGAN training loop for translating
 between distance masks and fluorescent images using unpaired data.
 
 Key features:
-- Bidirectional translation (Mask to Fluorescent)
+- Bidirectional translation (Mask ↔ Fluorescent)
 - Cycle consistency loss prevents memorization
 - Identity loss for better preservation
 - Learning rate scheduling
 - Image buffer for discriminator stability
 - Mixed precision training for speed
-- M to F emphasis for improved quality
+- M→F emphasis for improved quality
 - Structural loss for mask-fluorescent correspondence
 """
 
@@ -158,23 +158,29 @@ class CycleGANTrainer:
         
         # Initialize networks
         self.G_M2F = CycleGANGenerator(
-            input_channels=config.input_nc, 
-            output_channels=config.output_nc, 
+            input_nc=config.input_nc, 
+            output_nc=config.output_nc, 
+            ngf=config.ngf, 
             n_residual_blocks=config.n_residual_blocks
         ).to(self.device)
         
         self.G_F2M = CycleGANGenerator(
-            input_channels=config.output_nc, 
-            output_channels=config.input_nc, 
+            input_nc=config.output_nc, 
+            output_nc=config.input_nc, 
+            ngf=config.ngf, 
             n_residual_blocks=config.n_residual_blocks
         ).to(self.device)
         
         self.D_F = CycleGANDiscriminator(
-            input_channels=config.output_nc
+            input_nc=config.output_nc, 
+            ndf=config.ndf, 
+            n_layers=config.n_discriminator_layers
         ).to(self.device)
         
         self.D_M = CycleGANDiscriminator(
-            input_channels=config.input_nc
+            input_nc=config.input_nc, 
+            ndf=config.ndf, 
+            n_layers=config.n_discriminator_layers
         ).to(self.device)
         
         # Initialize weights
@@ -185,8 +191,8 @@ class CycleGANTrainer:
         
         # Loss functions
         self.loss_fn = CycleGANLoss(
-            cycle_loss_weight=config.lambda_cycle,
-            identity_loss_weight=config.lambda_identity
+            lambda_cycle=config.lambda_cycle,
+            lambda_identity=config.lambda_identity
         )
         
         # Structural loss for mask-fluorescent correspondence
@@ -424,12 +430,12 @@ class CycleGANTrainer:
                 pred_fake_F = self.D_F(fake_F)
                 pred_fake_M = self.D_M(fake_M)
                 
-                loss_G_M2F = self.loss_fn.adversarial_loss(pred_fake_F, target_is_real=True)
-                loss_G_F2M = self.loss_fn.adversarial_loss(pred_fake_M, target_is_real=True)
+                loss_G_M2F = self.loss_fn.generator_loss(pred_fake_F)
+                loss_G_F2M = self.loss_fn.generator_loss(pred_fake_M)
                 
                 # Cycle consistency loss
-                loss_cycle_M = self.loss_fn.cycle_consistency_loss(real_M, rec_M)
-                loss_cycle_F = self.loss_fn.cycle_consistency_loss(real_F, rec_F)
+                loss_cycle_M = self.loss_fn.cycle_loss(real_M, rec_M)
+                loss_cycle_F = self.loss_fn.cycle_loss(real_F, rec_F)
                 
                 # Identity loss
                 loss_identity_M = self.loss_fn.identity_loss(real_M, identity_M)
@@ -457,11 +463,11 @@ class CycleGANTrainer:
             pred_fake_F = self.D_F(fake_F)
             pred_fake_M = self.D_M(fake_M)
             
-            loss_G_M2F = self.loss_fn.adversarial_loss(pred_fake_F, target_is_real=True)
-            loss_G_F2M = self.loss_fn.adversarial_loss(pred_fake_M, target_is_real=True)
+            loss_G_M2F = self.loss_fn.generator_loss(pred_fake_F)
+            loss_G_F2M = self.loss_fn.generator_loss(pred_fake_M)
             
-            loss_cycle_M = self.loss_fn.cycle_consistency_loss(real_M, rec_M)
-            loss_cycle_F = self.loss_fn.cycle_consistency_loss(real_F, rec_F)
+            loss_cycle_M = self.loss_fn.cycle_loss(real_M, rec_M)
+            loss_cycle_F = self.loss_fn.cycle_loss(real_F, rec_F)
             
             loss_identity_M = self.loss_fn.identity_loss(real_M, identity_M)
             loss_identity_F = self.loss_fn.identity_loss(real_F, identity_F)
@@ -487,12 +493,12 @@ class CycleGANTrainer:
         
         # Real images
         pred_real_F = self.D_F(real_F)
-        loss_D_F_real = self.loss_fn.adversarial_loss(pred_real_F, target_is_real=True)
+        loss_D_F_real = self.loss_fn.discriminator_loss(pred_real_F, True)
         
         # Fake images from buffer
         fake_F_from_buffer = self.fake_F_buffer.push_and_pop(fake_F.detach())
         pred_fake_F = self.D_F(fake_F_from_buffer)
-        loss_D_F_fake = self.loss_fn.adversarial_loss(pred_fake_F, target_is_real=False)
+        loss_D_F_fake = self.loss_fn.discriminator_loss(pred_fake_F, False)
         
         loss_D_F = (loss_D_F_real + loss_D_F_fake) * 0.5
         
@@ -508,12 +514,12 @@ class CycleGANTrainer:
         
         # Real images
         pred_real_M = self.D_M(real_M)
-        loss_D_M_real = self.loss_fn.adversarial_loss(pred_real_M, target_is_real=True)
+        loss_D_M_real = self.loss_fn.discriminator_loss(pred_real_M, True)
         
         # Fake images from buffer
         fake_M_from_buffer = self.fake_M_buffer.push_and_pop(fake_M.detach())
         pred_fake_M = self.D_M(fake_M_from_buffer)
-        loss_D_M_fake = self.loss_fn.adversarial_loss(pred_fake_M, target_is_real=False)
+        loss_D_M_fake = self.loss_fn.discriminator_loss(pred_fake_M, False)
         
         loss_D_M = (loss_D_M_real + loss_D_M_fake) * 0.5
         
@@ -685,8 +691,7 @@ def create_config():
     parser.add_argument('--fast_mode', action='store_true', help='Fast training mode')
     
     # Data paths
-    parser.add_argument('--fluorescent_dir', type=str, required=True, help='Fluorescent images directory')
-    parser.add_argument('--mask_dir', type=str, required=True, help='Mask images directory')
+    parser.add_argument('--data_dir', type=str, required=True, help='Data directory')
     parser.add_argument('--output_dir', type=str, default='cyclegan_outputs', help='Output directory')
     parser.add_argument('--checkpoint_path', type=str, help='Pretrained checkpoint path')
     
@@ -708,12 +713,11 @@ def main():
         config.mixed_precision = True
     
     # Create dataset
-    print(f"Loading fluorescent data from {config.fluorescent_dir}")
-    print(f"Loading mask data from {config.mask_dir}")
+    print(f"Loading data from {config.data_dir}")
     dataset = UnpairedConditionalImageDataset(
-        fluorescent_dir=config.fluorescent_dir,
-        mask_dir=config.mask_dir,
+        data_dir=config.data_dir,
         transform=None,  # Add transforms if needed
+        mode='train'
     )
     
     dataloader = DataLoader(
