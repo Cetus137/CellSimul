@@ -24,10 +24,8 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from torchvision.utils import save_image
 
-from cyclegan_networks import CycleGANGenerator, CycleGANDiscriminator, CycleGANLoss, init_weights
-import sys
-sys.path.append('../cond_models')
-from unpaired_conditional_dataloader import UnpairedConditionalImageDataset
+from cyclegan_models.cyclegan_networks import CycleGANGenerator, CycleGANDiscriminator, CycleGANLoss, init_weights
+from cond_models.unpaired_conditional_dataloader import UnpairedConditionalImageDataset
 
 
 class ImageBuffer:
