@@ -468,6 +468,8 @@ def main():
                       help='Image size')
     parser.add_argument('--device', type=str, default=None,
                       help='Device to use (cuda/cpu)')
+    parser.add_argument('--save_interval', type=int, default=1,
+                      help='Interval for saving checkpoints and samples')
     
     args = parser.parse_args()
     
@@ -486,7 +488,7 @@ def main():
     trainer.train(
         num_epochs=args.epochs,
         batch_size=args.batch_size,
-        save_interval=10,
+        save_interval=args.save_interval,
         output_dir=args.output_dir
     )
 
