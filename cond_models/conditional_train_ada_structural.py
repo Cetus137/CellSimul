@@ -482,7 +482,7 @@ class ConditionalGANTrainer:
         conditioning_loss = -mse_difference  # Negative to encourage difference
         
         # Scale up conditioning loss to make it more visible (optional)
-        conditioning_weight = 1000.0  # Increased from 0.1 to make it more prominent
+        conditioning_weight = 100.0  # Increased from 0.1 to make it more prominent
         
         # Combined loss: adversarial + conditioning enforcement
         g_loss = g_adv_loss + conditioning_weight * conditioning_loss
