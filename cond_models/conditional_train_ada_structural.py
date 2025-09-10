@@ -478,15 +478,20 @@ class ConditionalGANTrainer:
         fake_with_shuffled = self.generator(shuffled_masks)
         
         # Conditioning loss: different masks should produce different outputs
-        conditioning_loss = -F.mse_loss(fake_fluorescent, fake_with_shuffled)  # Negative to encourage difference
+        mse_difference = F.mse_loss(fake_fluorescent, fake_with_shuffled)
+        conditioning_loss = -mse_difference  # Negative to encourage difference
+        
+        # Scale up conditioning loss to make it more visible (optional)
+        conditioning_weight = 10.0  # Increased from 0.1 to make it more prominent
         
         # Combined loss: adversarial + conditioning enforcement
-        g_loss = g_adv_loss + 0.1 * conditioning_loss
+        g_loss = g_adv_loss + conditioning_weight * conditioning_loss
         
         return {
             'loss': g_loss,
             'g_adv_loss': g_adv_loss.item(),
-            'g_conditioning_loss': conditioning_loss.item()
+            'g_conditioning_loss': conditioning_loss.item(),
+            'mask_difference_mse': mse_difference.item()  # Raw MSE for easier interpretation
         }
     
     def _discriminator_step(self, fake_fluorescent, real_fluorescent, masks):
