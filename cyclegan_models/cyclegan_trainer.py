@@ -401,7 +401,7 @@ class CycleGANTrainer:
         self.save_final_results(output_dir)
     
     def save_samples(self, epoch, output_dir):
-        """Save generated samples as individual grayscale TIFF files"""
+        """Save generated samples as 6-row summary TIFF with individually normalized subfigures"""
         self.G_M2F.eval()
         self.G_F2M.eval()
         
@@ -420,60 +420,80 @@ class CycleGANTrainer:
             reconstructed_masks = self.G_F2M(fake_fluorescent)
             reconstructed_fluorescent = self.G_M2F(fake_masks)
             
-            # Normalize tensor to [0, 255] range for TIFF saving
-            def normalize_to_uint8(tensor):
-                """Normalize tensor to [0, 255] range as uint8"""
-                # Clamp to handle any extreme values
-                tensor = torch.clamp(tensor, -1, 1)
-                # Convert from [-1, 1] to [0, 255]
-                tensor = ((tensor + 1.0) / 2.0 * 255.0).round()
-                return tensor.cpu().numpy().astype(np.uint8)
+            # Normalize each tensor individually to [0, 1] range for optimal contrast
+            def normalize_tensor_individual(tensor):
+                """Normalize each tensor individually to [0, 1] range using its own min/max"""
+                tensor = tensor.cpu()
+                # Normalize each image in the batch individually
+                normalized_batch = []
+                for i in range(tensor.size(0)):
+                    img = tensor[i:i+1]  # Keep batch dimension
+                    img_min = img.min()
+                    img_max = img.max()
+                    # Avoid division by zero
+                    if img_max - img_min > 1e-8:
+                        img_norm = (img - img_min) / (img_max - img_min)
+                    else:
+                        img_norm = torch.zeros_like(img)
+                    normalized_batch.append(img_norm)
+                return torch.cat(normalized_batch, dim=0)
             
-            # Create epoch directory
-            epoch_dir = os.path.join(output_dir, f'epoch_{epoch+1:03d}')
-            os.makedirs(epoch_dir, exist_ok=True)
+            # Apply individual normalization to all tensors
+            real_masks_norm = normalize_tensor_individual(real_masks)
+            fake_fluorescent_norm = normalize_tensor_individual(fake_fluorescent)
+            reconstructed_masks_norm = normalize_tensor_individual(reconstructed_masks)
+            real_fluorescent_norm = normalize_tensor_individual(real_fluorescent)
+            fake_masks_norm = normalize_tensor_individual(fake_masks)
+            reconstructed_fluorescent_norm = normalize_tensor_individual(reconstructed_fluorescent)
             
-            # Apply normalization and save each image type
-            real_masks_np = normalize_to_uint8(real_masks)
-            fake_fluorescent_np = normalize_to_uint8(fake_fluorescent)
-            reconstructed_masks_np = normalize_to_uint8(reconstructed_masks)
-            real_fluorescent_np = normalize_to_uint8(real_fluorescent)
-            fake_masks_np = normalize_to_uint8(fake_masks)
-            reconstructed_fluorescent_np = normalize_to_uint8(reconstructed_fluorescent)
+            # Create 6-row comparison
+            comparison = torch.cat([
+                real_masks_norm,               # Row 1: Real masks
+                fake_fluorescent_norm,         # Row 2: Generated fluorescent (M→F)
+                reconstructed_masks_norm,      # Row 3: Reconstructed masks (M→F→M)
+                real_fluorescent_norm,         # Row 4: Real fluorescent
+                fake_masks_norm,               # Row 5: Generated masks (F→M)
+                reconstructed_fluorescent_norm # Row 6: Reconstructed fluorescent (F→M→F)
+            ], dim=0)
             
-            # Save individual TIFF files for each sample in the batch
-            for i in range(real_masks.size(0)):
-                sample_prefix = f'sample_{i:02d}'
-                
-                # Save real masks
-                img = Image.fromarray(real_masks_np[i, 0], mode='L')  # [0] for channel dimension
-                img.save(os.path.join(epoch_dir, f'{sample_prefix}_real_mask.tif'))
-                
-                # Save generated fluorescent (M→F)
-                img = Image.fromarray(fake_fluorescent_np[i, 0], mode='L')
-                img.save(os.path.join(epoch_dir, f'{sample_prefix}_generated_fluorescent_M2F.tif'))
-                
-                # Save reconstructed masks (M→F→M)
-                img = Image.fromarray(reconstructed_masks_np[i, 0], mode='L')
-                img.save(os.path.join(epoch_dir, f'{sample_prefix}_reconstructed_mask_M2F2M.tif'))
-                
-                # Save real fluorescent
-                img = Image.fromarray(real_fluorescent_np[i, 0], mode='L')
-                img.save(os.path.join(epoch_dir, f'{sample_prefix}_real_fluorescent.tif'))
-                
-                # Save generated masks (F→M)
-                img = Image.fromarray(fake_masks_np[i, 0], mode='L')
-                img.save(os.path.join(epoch_dir, f'{sample_prefix}_generated_mask_F2M.tif'))
-                
-                # Save reconstructed fluorescent (F→M→F)
-                img = Image.fromarray(reconstructed_fluorescent_np[i, 0], mode='L')
-                img.save(os.path.join(epoch_dir, f'{sample_prefix}_reconstructed_fluorescent_F2M2F.tif'))
+            # Convert to numpy array for TIFF saving
+            comparison_np = comparison.numpy()
             
-            print(f"Saved CycleGAN samples to {epoch_dir}/")
-            print(f"  Saved {real_masks.size(0)} samples with 6 image types each")
-            print(f"  Image types: real_mask, generated_fluorescent_M2F, reconstructed_mask_M2F2M,")
-            print(f"               real_fluorescent, generated_mask_F2M, reconstructed_fluorescent_F2M2F")
-            print(f"  Format: Grayscale TIFF, 8-bit, range [0-255]")
+            # Create grid layout (6 rows x batch_size columns)
+            batch_size = real_masks.size(0)
+            img_height, img_width = comparison_np.shape[2], comparison_np.shape[3]
+            
+            # Arrange into grid: 6 rows, batch_size columns
+            grid_height = 6 * img_height
+            grid_width = batch_size * img_width
+            grid_image = np.zeros((grid_height, grid_width), dtype=np.float32)
+            
+            for row in range(6):
+                for col in range(batch_size):
+                    img_idx = row * batch_size + col
+                    y_start = row * img_height
+                    y_end = (row + 1) * img_height
+                    x_start = col * img_width
+                    x_end = (col + 1) * img_width
+                    grid_image[y_start:y_end, x_start:x_end] = comparison_np[img_idx, 0]
+            
+            # Convert to 8-bit for TIFF saving
+            grid_image_uint8 = (grid_image * 255.0).round().astype(np.uint8)
+            
+            # Save as TIFF
+            save_path = os.path.join(output_dir, f'cyclegan_samples_epoch_{epoch+1:03d}.tif')
+            Image.fromarray(grid_image_uint8, mode='L').save(save_path)
+            
+            print(f"Saved CycleGAN samples to {save_path}")
+            print(f"  Format: 6-row summary TIFF, {batch_size} samples per row")
+            print(f"  Row 1: Real masks")
+            print(f"  Row 2: Generated fluorescent (M→F)")
+            print(f"  Row 3: Reconstructed masks (M→F→M)")
+            print(f"  Row 4: Real fluorescent")
+            print(f"  Row 5: Generated masks (F→M)")
+            print(f"  Row 6: Reconstructed fluorescent (F→M→F)")
+            print(f"  Normalization: Each subfigure individually normalized for optimal contrast")
+            print(f"  Image size: {grid_width}×{grid_height} pixels, 8-bit grayscale")
     
     def save_model(self, epoch, output_dir):
         """Save model checkpoints"""
