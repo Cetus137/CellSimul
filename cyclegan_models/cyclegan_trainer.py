@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from torchvision.utils import save_image
 from torch.cuda.amp import autocast, GradScaler
+from PIL import Image
 
 import sys
 import os
@@ -400,7 +401,7 @@ class CycleGANTrainer:
         self.save_final_results(output_dir)
     
     def save_samples(self, epoch, output_dir):
-        """Save generated samples"""
+        """Save generated samples as individual grayscale TIFF files"""
         self.G_M2F.eval()
         self.G_F2M.eval()
         
@@ -419,44 +420,60 @@ class CycleGANTrainer:
             reconstructed_masks = self.G_F2M(fake_fluorescent)
             reconstructed_fluorescent = self.G_M2F(fake_masks)
             
-            # Normalize each tensor to [0, 1] range for proper visualization
-            def normalize_tensor(tensor):
-                """Normalize tensor to [0, 1] range"""
+            # Normalize tensor to [0, 255] range for TIFF saving
+            def normalize_to_uint8(tensor):
+                """Normalize tensor to [0, 255] range as uint8"""
                 # Clamp to handle any extreme values
                 tensor = torch.clamp(tensor, -1, 1)
-                # Convert from [-1, 1] to [0, 1]
-                return (tensor + 1.0) / 2.0
+                # Convert from [-1, 1] to [0, 255]
+                tensor = ((tensor + 1.0) / 2.0 * 255.0).round()
+                return tensor.cpu().numpy().astype(np.uint8)
             
-            # Apply normalization to all tensors
-            real_masks_norm = normalize_tensor(real_masks.cpu())
-            fake_fluorescent_norm = normalize_tensor(fake_fluorescent.cpu())
-            reconstructed_masks_norm = normalize_tensor(reconstructed_masks.cpu())
-            real_fluorescent_norm = normalize_tensor(real_fluorescent.cpu())
-            fake_masks_norm = normalize_tensor(fake_masks.cpu())
-            reconstructed_fluorescent_norm = normalize_tensor(reconstructed_fluorescent.cpu())
+            # Create epoch directory
+            epoch_dir = os.path.join(output_dir, f'epoch_{epoch+1:03d}')
+            os.makedirs(epoch_dir, exist_ok=True)
             
-            # Create comparison
-            comparison = torch.cat([
-                real_masks_norm,               # Row 1: Real masks
-                fake_fluorescent_norm,         # Row 2: Generated fluorescent (M→F)
-                reconstructed_masks_norm,      # Row 3: Reconstructed masks (M→F→M)
-                real_fluorescent_norm,         # Row 4: Real fluorescent
-                fake_masks_norm,               # Row 5: Generated masks (F→M)
-                reconstructed_fluorescent_norm # Row 6: Reconstructed fluorescent (F→M→F)
-            ], dim=0)
+            # Apply normalization and save each image type
+            real_masks_np = normalize_to_uint8(real_masks)
+            fake_fluorescent_np = normalize_to_uint8(fake_fluorescent)
+            reconstructed_masks_np = normalize_to_uint8(reconstructed_masks)
+            real_fluorescent_np = normalize_to_uint8(real_fluorescent)
+            fake_masks_np = normalize_to_uint8(fake_masks)
+            reconstructed_fluorescent_np = normalize_to_uint8(reconstructed_fluorescent)
             
-            save_path = os.path.join(output_dir, f'cyclegan_samples_epoch_{epoch+1}.png')
-            # Use normalize=False since we've already normalized manually to [0,1]
-            # This ensures the output PNG will have proper [0,255] values
-            save_image(comparison, save_path, nrow=real_masks.size(0), normalize=False)
+            # Save individual TIFF files for each sample in the batch
+            for i in range(real_masks.size(0)):
+                sample_prefix = f'sample_{i:02d}'
+                
+                # Save real masks
+                img = Image.fromarray(real_masks_np[i, 0], mode='L')  # [0] for channel dimension
+                img.save(os.path.join(epoch_dir, f'{sample_prefix}_real_mask.tif'))
+                
+                # Save generated fluorescent (M→F)
+                img = Image.fromarray(fake_fluorescent_np[i, 0], mode='L')
+                img.save(os.path.join(epoch_dir, f'{sample_prefix}_generated_fluorescent_M2F.tif'))
+                
+                # Save reconstructed masks (M→F→M)
+                img = Image.fromarray(reconstructed_masks_np[i, 0], mode='L')
+                img.save(os.path.join(epoch_dir, f'{sample_prefix}_reconstructed_mask_M2F2M.tif'))
+                
+                # Save real fluorescent
+                img = Image.fromarray(real_fluorescent_np[i, 0], mode='L')
+                img.save(os.path.join(epoch_dir, f'{sample_prefix}_real_fluorescent.tif'))
+                
+                # Save generated masks (F→M)
+                img = Image.fromarray(fake_masks_np[i, 0], mode='L')
+                img.save(os.path.join(epoch_dir, f'{sample_prefix}_generated_mask_F2M.tif'))
+                
+                # Save reconstructed fluorescent (F→M→F)
+                img = Image.fromarray(reconstructed_fluorescent_np[i, 0], mode='L')
+                img.save(os.path.join(epoch_dir, f'{sample_prefix}_reconstructed_fluorescent_F2M2F.tif'))
             
-            print(f"Saved CycleGAN samples to {save_path}")
-            print(f"  Row 1: Real masks")
-            print(f"  Row 2: Generated fluorescent (M→F)")
-            print(f"  Row 3: Reconstructed masks (M→F→M)")
-            print(f"  Row 4: Real fluorescent")
-            print(f"  Row 5: Generated masks (F→M)")
-            print(f"  Row 6: Reconstructed fluorescent (F→M→F)")
+            print(f"Saved CycleGAN samples to {epoch_dir}/")
+            print(f"  Saved {real_masks.size(0)} samples with 6 image types each")
+            print(f"  Image types: real_mask, generated_fluorescent_M2F, reconstructed_mask_M2F2M,")
+            print(f"               real_fluorescent, generated_mask_F2M, reconstructed_fluorescent_F2M2F")
+            print(f"  Format: Grayscale TIFF, 8-bit, range [0-255]")
     
     def save_model(self, epoch, output_dir):
         """Save model checkpoints"""
